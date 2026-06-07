@@ -26,6 +26,7 @@ import './commands/pane.js';
 import './commands/tab.js';
 import './commands/stream.js';
 import './commands/binance.js';
+import './commands/binance_live.js';
 
 // Run
 import { run } from './router.js';

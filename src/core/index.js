@@ -15,3 +15,4 @@ export * as watchlist from './watchlist.js';
 export * as indicators from './indicators.js';
 export * as ui from './ui.js';
 export * as binance from './binance.js';
+export * as binanceLive from './binance_live.js';
