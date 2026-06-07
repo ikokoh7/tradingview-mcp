@@ -16,3 +16,4 @@ export * as indicators from './indicators.js';
 export * as ui from './ui.js';
 export * as binance from './binance.js';
 export * as binanceLive from './binance_live.js';
+export * as risk from './risk.js';
