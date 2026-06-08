@@ -28,9 +28,13 @@
  *
  * A confirmed confluence then runs through the deterministic Trading Trident
  * risk rules (caps, R:R/win-rate breakeven, capital-aware sizing), gets
- * translated into a spot-executable order, and is placed — only if every
- * rule passes and the order is faithfully executable on a SPOT account (no
- * shorting; bearish signals require existing inventory to sell).
+ * translated into a spot-executable order — only if every rule passes and the
+ * order is faithfully executable on a SPOT account (no shorting; bearish
+ * signals require existing inventory to sell) — and is placed laddered
+ * (Ch.1, "Laddering": multiple limit orders spread across a price range "to
+ * lower the average entry price") across the trade's own [entry, stop] risk
+ * envelope, falling back to a single market order when a ladder can't clear
+ * exchange minimums.
  *
  * State is tracked in auto_trade_state.json (one entry per symbol, keyed on
  * the agreeing strategies + their confirming candles' open_times) so the
@@ -66,6 +70,7 @@ const { detectZones, findZoneRetests, buildZoneTradePlan } = await import('../sr
 const { scanForFibReaction, buildFibTradePlan } = await import('../src/core/fibonacci.js');
 const { detectMarketStructure, buildStructureTradePlan } = await import('../src/core/market_structure.js');
 const { scanForPinbarSetup, buildPinbarTradePlan } = await import('../src/core/pinbar.js');
+const { buildLadderOrders } = await import('../src/core/laddering.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
 const { evaluateTradeSetup, translateForAccount } = await import('../src/core/risk.js');
 
@@ -74,6 +79,7 @@ const INTERVAL = '15m';
 const RISK_PERCENT = 1; // bottom of the curriculum's 1-3% per-trade cap
 const HISTORICAL_WIN_RATE = 40; // conservative placeholder pending a measured backtest harness
 const FRESHNESS_BARS = 2; // only act on signals confirmed within the last N closed bars
+const LADDER_ORDERS = 3; // Ch.1's worked examples ladder into 3 or 5 rungs — pick the smaller, more conservative split
 const RSI_PERIOD = 14; // curriculum default for divergence detection
 
 const STATE_PATH = join(ROOT, 'auto_trade_state.json');
@@ -354,13 +360,49 @@ for (const symbol of SYMBOLS) {
       continue;
     }
 
-    log(`${symbol}: EXECUTING ${exec.order_side} ${quantity} ${asset} @ ~${plan.entry} — ` +
-        `${confluence.confidence}, R:R 1:${gate.reward_per_risk.toFixed(2)}, gate passed (${exec.note})`);
+    // Laddering (Ch.1, 1.9.2): "distribute multiple buy/sell orders... across
+    // a price range... to lower the average entry price" rather than placing
+    // it all at one price. Our strategies confirm a single precise CLOSE-based
+    // entry (no "not sure where exactly" zone to spread across like the
+    // curriculum's worked example), so the only price range already on hand
+    // — and the only one that doesn't require inventing a new parameter — is
+    // the trade's own risk envelope: [entry, stop]. Price may keep drifting
+    // toward the stop before turning in our favor; laddering limit orders
+    // across that span catches it at progressively better prices without ever
+    // placing an order beyond the level that would invalidate the idea.
+    // Falls back to the single market order this bot has always used when the
+    // ladder can't be built (zero-width entry==stop) or a rung's size can't
+    // clear the exchange minimums (laddering a near-minimum position into
+    // dust-sized rungs would just get every leg rejected).
+    const ladderLow = Math.min(plan.entry, plan.stop);
+    const ladderHigh = Math.max(plan.entry, plan.stop);
+    let ladder = null;
+    if (ladderHigh > ladderLow) {
+      const built = buildLadderOrders({ side: exec.order_side.toLowerCase(), totalSize: quantity, priceLow: ladderLow, priceHigh: ladderHigh, numOrders: LADDER_ORDERS });
+      const rungs = built.orders.map(o => ({ price: o.price, size: floorToStep(o.size, filters.stepSize) }));
+      if (rungs.every(r => r.size >= filters.minQty && r.size * r.price >= filters.minNotional)) ladder = rungs;
+    }
 
-    const order = await placeOrder({ symbol, side: exec.order_side, type: 'MARKET', quantity });
-    log(`${symbol}: order result — ${JSON.stringify(order)}`);
+    if (ladder) {
+      log(`${symbol}: EXECUTING ${exec.order_side} ${quantity} ${asset} laddered into ${ladder.length} limit orders ` +
+          `across ${ladderLow}-${ladderHigh} (avg ~${(ladder.reduce((s, r) => s + r.price, 0) / ladder.length).toFixed(8)}) — ` +
+          `${confluence.confidence}, R:R 1:${gate.reward_per_risk.toFixed(2)}, gate passed (${exec.note})`);
 
-    state[symbol] = { last_signal_key: combinedKey, outcome: 'executed', order, executed_at: new Date().toISOString() };
+      const orders = [];
+      for (const rung of ladder) {
+        const order = await placeOrder({ symbol, side: exec.order_side, type: 'LIMIT', quantity: rung.size, price: rung.price });
+        log(`${symbol}: order result — ${JSON.stringify(order)}`);
+        orders.push(order);
+      }
+      state[symbol] = { last_signal_key: combinedKey, outcome: 'executed', orders, executed_at: new Date().toISOString() };
+    } else {
+      log(`${symbol}: EXECUTING ${exec.order_side} ${quantity} ${asset} @ ~${plan.entry} — ` +
+          `${confluence.confidence}, R:R 1:${gate.reward_per_risk.toFixed(2)}, gate passed (${exec.note})`);
+
+      const order = await placeOrder({ symbol, side: exec.order_side, type: 'MARKET', quantity });
+      log(`${symbol}: order result — ${JSON.stringify(order)}`);
+      state[symbol] = { last_signal_key: combinedKey, outcome: 'executed', order, executed_at: new Date().toISOString() };
+    }
   } catch (err) {
     log(`${symbol}: ERROR — ${err.message}`);
   }
