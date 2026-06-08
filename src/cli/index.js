@@ -30,6 +30,7 @@ import './commands/binance_live.js';
 import './commands/risk.js';
 import './commands/sfp.js';
 import './commands/divergence.js';
+import './commands/confluence.js';
 
 // Run
 import { run } from './router.js';
