@@ -4,11 +4,14 @@
  * spot-account execution pass.
  *
  * Run on a timer (Windows Task Scheduler) — each invocation does ONE pass:
- * scans BTC/ETH/BNB on the 15m timeframe with THREE independently-coded
+ * scans BTC/ETH/BNB on the 15m timeframe with FOUR independently-coded
  * strategies — Swing Failure Pattern (close-based sweep confirmation),
- * RSI Divergence (close-based price/oscillator swing comparison), and
+ * RSI Divergence (close-based price/oscillator swing comparison),
  * Key Levels/Zones (consolidation-range breakout -> support/resistance
- * zone -> retest) — and requires CONFLUENCE: per the curriculum's repeated guidance that
+ * zone -> retest), and Fibonacci golden-pocket reaction (retracement off
+ * the most recent swing wicks into the 0.618-0.66 zone and rejects, the
+ * same sweep-and-reject mechanic as SFP applied to a fib zone) — and
+ * requires CONFLUENCE: per the curriculum's repeated guidance that
  * complementary techniques produce more accurate setups ("adding further
  * confirmations leads to a more profitable setup"; SFP retests are "higher
  * conviction, not a lesser consolation entry"), a setup is only acted on
@@ -54,6 +57,7 @@ const { getKlines, accountInfo, placeOrder } = await import('../src/core/binance
 const { findSwingHighs, findSwingLows, scanForSFP, buildSFPTradePlan } = await import('../src/core/sfp.js');
 const { scanForDivergence, buildDivergenceTradePlan } = await import('../src/core/divergence.js');
 const { detectZones, findZoneRetests, buildZoneTradePlan } = await import('../src/core/levels.js');
+const { scanForFibReaction, buildFibTradePlan } = await import('../src/core/fibonacci.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
 const { evaluateTradeSetup, translateForAccount } = await import('../src/core/risk.js');
 
@@ -188,6 +192,28 @@ function findFreshLevelZoneSignal(klines, ctx) {
   };
 }
 
+function findFreshFibSignal(klines, ctx) {
+  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
+  const { direction, hits } = scanForFibReaction(klines, { swingHigh: lastSwingHigh, swingLow: lastSwingLow });
+  if (!hits.length) return null;
+  const hit = hits[hits.length - 1];
+  if (lastIndex - hit.index > FRESHNESS_BARS) return null;
+
+  // Bullish reaction (golden-pocket support) -> long, continuation toward the
+  // swing high being retraced from; bearish (resistance) -> short, toward the
+  // swing low — same opposite-side-target convention as the other strategies.
+  const target = direction === 'bullish' ? lastSwingHigh.price : lastSwingLow.price;
+  const alt = direction === 'bullish' ? rangeHigh : rangeLow;
+  const plan = buildFibTradePlan({ hit, direction, lastSwingLevel: target, rangeLevel: alt });
+  return {
+    strategy: 'fibonacci',
+    plan,
+    confirmedAt: hit.bar.open_time,
+    signalKey: `fibonacci:${direction}:${hit.bar.open_time}`,
+    summary: `${direction} golden-pocket reaction (${hit.kind}, entry ${plan.entry}, stop ${plan.stop})`,
+  };
+}
+
 const state = loadState();
 const account = await accountInfo();
 const balanceOf = (asset) => account.balances.find(b => b.asset === asset)?.free ?? 0;
@@ -222,7 +248,8 @@ for (const symbol of SYMBOLS) {
     const sfpSignal = findFreshSFPSignal(klines, ctx);
     const divergenceSignal = findFreshDivergenceSignal(klines, ctx);
     const levelsSignal = findFreshLevelZoneSignal(klines, ctx);
-    const signals = [sfpSignal, divergenceSignal, levelsSignal].filter(Boolean);
+    const fibSignal = findFreshFibSignal(klines, ctx);
+    const signals = [sfpSignal, divergenceSignal, levelsSignal, fibSignal].filter(Boolean);
 
     if (!signals.length) { log(`${symbol}: no fresh signals from any strategy within the last ${FRESHNESS_BARS} closed bars`); continue; }
 

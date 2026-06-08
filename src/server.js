@@ -20,6 +20,7 @@ import { registerRiskTools } from './tools/risk.js';
 import { registerSfpTools } from './tools/sfp.js';
 import { registerDivergenceTools } from './tools/divergence.js';
 import { registerLevelsTools } from './tools/levels.js';
+import { registerFibonacciTools } from './tools/fibonacci.js';
 import { registerConfluenceTools } from './tools/confluence.js';
 
 const server = new McpServer(
@@ -97,6 +98,7 @@ registerRiskTools(server);
 registerSfpTools(server);
 registerDivergenceTools(server);
 registerLevelsTools(server);
+registerFibonacciTools(server);
 registerConfluenceTools(server);
 
 // Startup notice (stderr so it doesn't interfere with MCP stdio protocol)

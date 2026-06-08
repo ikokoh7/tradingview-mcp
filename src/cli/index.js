@@ -31,6 +31,7 @@ import './commands/risk.js';
 import './commands/sfp.js';
 import './commands/divergence.js';
 import './commands/levels.js';
+import './commands/fibonacci.js';
 import './commands/confluence.js';
 
 // Run
