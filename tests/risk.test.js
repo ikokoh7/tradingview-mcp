@@ -13,6 +13,7 @@ import {
   evolvingR,
   checkRiskLimits,
   evaluateTradeSetup,
+  translateForAccount,
 } from '../src/core/risk.js';
 
 describe('positionSize()', () => {
@@ -20,6 +21,23 @@ describe('positionSize()', () => {
     const { position_size, risk_amount } = positionSize({ capital: 10000, riskPercent: 3, stopLossPercent: 5 });
     assert.equal(risk_amount, 300);
     assert.equal(position_size, 6000);
+  });
+
+  it('leaves the size untouched when it already fits within available capital', () => {
+    const result = positionSize({ capital: 10000, riskPercent: 3, stopLossPercent: 5, availableCapital: 9000 });
+    assert.equal(result.position_size, 6000);
+    assert.equal(result.ideal_position_size, 6000);
+    assert.equal(result.capital_constrained, false);
+  });
+
+  it('caps the size at available capital when the formula calls for more than the account holds', () => {
+    // tight 0.23%-ish stop on a small account -> ideal size far exceeds capital
+    const result = positionSize({ capital: 9937.8, riskPercent: 1, stopLossPercent: 0.23, availableCapital: 9937.8 });
+    assert.ok(result.ideal_position_size > result.position_size);
+    assert.equal(result.position_size, 9937.8);
+    assert.equal(result.capital_constrained, true);
+    // realized risk amount shrinks proportionally to the capped size (under-risking, not over-risking)
+    assert.ok(result.risk_amount < result.ideal_position_size * (0.23 / 100));
   });
 
   it('matches the second worked example: $1k, 1% risk, 5% stop -> $200', () => {
@@ -180,5 +198,62 @@ describe('evaluateTradeSetup() — Trading Trident gate', () => {
     });
     assert.equal(result.passes, false);
     assert.ok(result.reasons.some(r => r.includes('below the')));
+  });
+
+  it('caps position size at availableCapital and still passes (under-risking is acceptable)', () => {
+    // tight stop -> formula wants a much larger size than the small account holds
+    const result = evaluateTradeSetup({
+      capital: 9937.8,
+      riskPercent: 1,
+      entry: 1688.05,
+      stop: 1691.94,
+      target: 1679.13,
+      side: 'short',
+      historicalWinRate: 40,
+      availableCapital: 9937.8,
+    });
+    assert.equal(result.passes, true);
+    assert.equal(result.capital_constrained, true);
+    assert.ok(result.position_size < result.ideal_position_size);
+    assert.equal(result.position_size, 9937.8);
+  });
+});
+
+describe('translateForAccount() — spot/margin/futures execution translation', () => {
+  it('passes a long signal through as a direct buy on spot', () => {
+    const plan = { side: 'long', entry: 100 };
+    const result = translateForAccount({ plan, accountType: 'spot', positionSizeUsd: 1000 });
+    assert.equal(result.executable, true);
+    assert.equal(result.order_side, 'buy');
+    assert.equal(result.quantity, 10);
+  });
+
+  it('translates a short signal on spot into selling held inventory, capped at what is held', () => {
+    const plan = { side: 'short', entry: 1688.05 };
+    // ideal quantity = 43124.7 / 1688.05 ~= 25.5, but only 1 unit is held
+    const result = translateForAccount({ plan, accountType: 'spot', positionSizeUsd: 43124.7, heldQuantity: 1 });
+    assert.equal(result.executable, true);
+    assert.equal(result.order_side, 'sell');
+    assert.equal(result.quantity, 1);
+    assert.equal(result.capped_by_holdings, true);
+  });
+
+  it('reports a short signal as not executable on spot when nothing is held', () => {
+    const plan = { side: 'short', entry: 1688.05 };
+    const result = translateForAccount({ plan, accountType: 'spot', positionSizeUsd: 1000, heldQuantity: 0 });
+    assert.equal(result.executable, false);
+    assert.equal(result.quantity, 0);
+  });
+
+  it('opens a native short directly on margin/futures accounts', () => {
+    const plan = { side: 'short', entry: 100 };
+    const result = translateForAccount({ plan, accountType: 'futures', positionSizeUsd: 1000, heldQuantity: 0 });
+    assert.equal(result.executable, true);
+    assert.equal(result.order_side, 'sell');
+    assert.equal(result.quantity, 10);
+  });
+
+  it('rejects an unknown account type', () => {
+    assert.throws(() => translateForAccount({ plan: { side: 'long', entry: 100 }, accountType: 'ira', positionSizeUsd: 100 }));
   });
 });

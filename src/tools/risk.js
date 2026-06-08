@@ -10,14 +10,23 @@ import * as core from '../core/risk.js';
  * live judgment.
  */
 export function registerRiskTools(server) {
-  server.tool('risk_position_size', 'Calculate position size from capital, risk %, and stop-loss distance %', {
-    capital: z.coerce.number().positive().describe('Total account capital'),
-    risk_percent: z.coerce.number().min(0).max(100).describe('Percent of capital to risk on this trade (e.g. 2 for 2%)'),
-    stop_loss_percent: z.coerce.number().positive().describe('Distance from entry to stop loss, as a percent (e.g. 5 for 5%)'),
-  }, async ({ capital, risk_percent, stop_loss_percent }) => {
-    try { return jsonResult({ success: true, ...core.positionSize({ capital, riskPercent: risk_percent, stopLossPercent: stop_loss_percent }) }); }
-    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
-  });
+  server.tool(
+    'risk_position_size',
+    'Calculate position size from capital, risk %, and stop-loss distance %. Pass available_capital ' +
+    '(actual deployable balance) to cap the result at what the account can actually execute — the formula ' +
+    'alone can recommend a position larger than the account holds (e.g. a tight stop on a small account); ' +
+    'capping under-risks rather than over-risks, which is always acceptable per the curriculum\'s caps.',
+    {
+      capital: z.coerce.number().positive().describe('Total account capital'),
+      risk_percent: z.coerce.number().min(0).max(100).describe('Percent of capital to risk on this trade (e.g. 2 for 2%)'),
+      stop_loss_percent: z.coerce.number().positive().describe('Distance from entry to stop loss, as a percent (e.g. 5 for 5%)'),
+      available_capital: z.coerce.number().positive().optional().describe('Actual deployable balance — caps the recommended size at what is executable'),
+    },
+    async ({ capital, risk_percent, stop_loss_percent, available_capital }) => {
+      try { return jsonResult({ success: true, ...core.positionSize({ capital, riskPercent: risk_percent, stopLossPercent: stop_loss_percent, availableCapital: available_capital }) }); }
+      catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
 
   server.tool('risk_reward_ratio', 'Calculate the risk:reward ratio for a trade given entry, stop, and target prices', {
     entry: z.coerce.number().positive().describe('Entry price'),
@@ -83,8 +92,9 @@ export function registerRiskTools(server) {
       target: z.coerce.number().positive().describe('Target/take-profit price'),
       side: z.enum(['long', 'short']).optional().describe('Trade direction (default "long")'),
       historical_win_rate: z.coerce.number().min(0).max(100).optional().describe('Your historical win rate %, if known — enables the win-rate/R:R breakeven check'),
+      available_capital: z.coerce.number().positive().optional().describe('Actual deployable balance — caps the recommended position size at what is executable (under-risking, never over-risking)'),
     },
-    async ({ capital, risk_percent, leverage, entry, stop, target, side, historical_win_rate }) => {
+    async ({ capital, risk_percent, leverage, entry, stop, target, side, historical_win_rate, available_capital }) => {
       try {
         return jsonResult({
           success: true,
@@ -97,6 +107,36 @@ export function registerRiskTools(server) {
             target,
             side,
             historicalWinRate: historical_win_rate,
+            availableCapital: available_capital,
+          }),
+        });
+      } catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
+
+  server.tool(
+    'risk_translate_for_account',
+    'Translate a directional trade plan ({side, entry}, e.g. from sfp_build_trade_plan) into an executable order ' +
+    'for a given account type. Spot accounts cannot open a short — there is nothing to borrow and sell — so a ' +
+    'bearish ("short") signal is translated into selling existing inventory of the asset (capped at what is held); ' +
+    'margin/futures accounts can open either side natively. Returns executable: false when a spot account holds ' +
+    'nothing to sell against a bearish signal.',
+    {
+      side: z.enum(['long', 'short']).describe('Trade direction from the plan'),
+      entry: z.coerce.number().positive().describe('Planned entry price (used to convert the $ position size into a quantity)'),
+      account_type: z.enum(['spot', 'margin', 'futures']).optional().describe('Account type to execute on (default "spot")'),
+      position_size_usd: z.coerce.number().positive().describe('Position size in $ (e.g. from risk_evaluate_trade_setup)'),
+      held_quantity: z.coerce.number().min(0).optional().describe('Quantity of the asset currently held — required to translate a short onto a spot account (default 0)'),
+    },
+    async ({ side, entry, account_type, position_size_usd, held_quantity }) => {
+      try {
+        return jsonResult({
+          success: true,
+          ...core.translateForAccount({
+            plan: { side, entry },
+            accountType: account_type,
+            positionSizeUsd: position_size_usd,
+            heldQuantity: held_quantity,
           }),
         });
       } catch (err) { return jsonResult({ success: false, error: err.message }, true); }

@@ -20,13 +20,28 @@ function requireFiniteInRange(value, name, min, max) {
 }
 
 // position size = (capital * risk%) / stop-loss distance%
-export function positionSize({ capital, riskPercent, stopLossPercent } = {}) {
+//
+// The formula alone can recommend a position larger than the account actually
+// holds (e.g. a tight stop on a small account implies a large size to still
+// risk the target %). Pass `availableCapital` (the actual deployable balance)
+// to cap the result at what's executable — under-risking by capping is always
+// conservative/acceptable per the curriculum's caps (they're a ceiling, not a floor).
+export function positionSize({ capital, riskPercent, stopLossPercent, availableCapital } = {}) {
   const cap = requirePositiveFinite(capital, 'capital');
   const risk = requireFiniteInRange(riskPercent, 'riskPercent', 0, 100);
   const stopDistance = requirePositiveFinite(stopLossPercent, 'stopLossPercent');
   const riskAmount = cap * (risk / 100);
-  const size = riskAmount / (stopDistance / 100);
-  return { risk_amount: riskAmount, position_size: size };
+  const idealSize = riskAmount / (stopDistance / 100);
+
+  if (availableCapital === undefined) {
+    return { risk_amount: riskAmount, position_size: idealSize, ideal_position_size: idealSize, capital_constrained: false };
+  }
+  const avail = requirePositiveFinite(availableCapital, 'availableCapital');
+  if (idealSize <= avail) {
+    return { risk_amount: riskAmount, position_size: idealSize, ideal_position_size: idealSize, capital_constrained: false };
+  }
+  const actualRiskAmount = avail * (stopDistance / 100);
+  return { risk_amount: actualRiskAmount, position_size: avail, ideal_position_size: idealSize, capital_constrained: true };
 }
 
 // R:R = (entry - stop) / (target - entry) for longs; mirrored for shorts
@@ -126,6 +141,7 @@ export function evaluateTradeSetup({
   target,
   side = 'long',
   historicalWinRate,
+  availableCapital,
 } = {}) {
   const limits = checkRiskLimits({ riskPercent, leverage });
   const rr = riskRewardRatio({ entry, stop, target, side });
@@ -145,7 +161,7 @@ export function evaluateTradeSetup({
   }
 
   const stopLossPercent = (Math.abs(entry - stop) / entry) * 100;
-  const sizing = positionSize({ capital, riskPercent, stopLossPercent });
+  const sizing = positionSize({ capital, riskPercent, stopLossPercent, availableCapital });
 
   return {
     passes: reasons.length === 0,
@@ -154,6 +170,57 @@ export function evaluateTradeSetup({
     reward_per_risk: rewardPerRisk,
     min_reward_per_risk_required: minRequired?.min_reward_per_risk,
     position_size: sizing.position_size,
+    ideal_position_size: sizing.ideal_position_size,
+    capital_constrained: sizing.capital_constrained,
     risk_amount: sizing.risk_amount,
+  };
+}
+
+/**
+ * Translate a directional trade plan ({side, entry, ...}, e.g. from
+ * buildSFPTradePlan) into an executable order for a given account type.
+ *
+ * Spot accounts cannot open a short — there's nothing to "borrow and sell".
+ * The closest faithful expression of a bearish signal on spot is selling
+ * existing inventory of the asset (reducing/closing long exposure), capped at
+ * what's actually held. Margin/futures accounts can open either side natively.
+ */
+export function translateForAccount({ plan, accountType = 'spot', positionSizeUsd, heldQuantity = 0 } = {}) {
+  if (!plan || !['long', 'short'].includes(plan.side)) throw new Error('plan must include side: "long" or "short" (e.g. from buildSFPTradePlan)');
+  const type = String(accountType).toLowerCase();
+  if (!['spot', 'margin', 'futures'].includes(type)) throw new Error('accountType must be "spot", "margin", or "futures"');
+  const sizeUsd = requirePositiveFinite(positionSizeUsd, 'positionSizeUsd');
+  const entry = requirePositiveFinite(plan.entry, 'plan.entry');
+  const idealQuantity = sizeUsd / entry;
+
+  if (type !== 'spot' || plan.side === 'long') {
+    return {
+      executable: true,
+      order_side: plan.side === 'long' ? 'buy' : 'sell',
+      quantity: idealQuantity,
+      capped_by_holdings: false,
+      note: type === 'spot'
+        ? 'spot buy — long signals are directly executable on spot'
+        : `${type} account can open a native ${plan.side} — directly executable`,
+    };
+  }
+
+  const held = requireFiniteInRange(heldQuantity, 'heldQuantity', 0, Number.MAX_SAFE_INTEGER);
+  if (held <= 0) {
+    return {
+      executable: false,
+      order_side: undefined,
+      quantity: 0,
+      capped_by_holdings: false,
+      note: 'spot account cannot open a short and holds no inventory of this asset to sell — acting on this signal requires a margin/futures account',
+    };
+  }
+  const quantity = Math.min(idealQuantity, held);
+  return {
+    executable: true,
+    order_side: 'sell',
+    quantity,
+    capped_by_holdings: quantity < idealQuantity,
+    note: 'spot account cannot open a short — selling held inventory as the closest faithful spot-equivalent of the bearish signal',
   };
 }

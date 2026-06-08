@@ -5,13 +5,21 @@ register('risk', {
   description: 'Deterministic risk-management math (position sizing, R:R, drawdown, evolving R, trade gate)',
   subcommands: new Map([
     ['size', {
-      description: 'Position size from capital, risk %, and stop-loss distance %',
+      description: 'Position size from capital, risk %, and stop-loss distance % (optionally capped at available capital)',
+      options: {
+        'available-capital': { type: 'string', short: 'a', description: 'Actual deployable balance — caps the result at what is executable' },
+      },
       handler: (opts, positionals) => {
         const [capital, riskPercent, stopLossPercent] = positionals;
         if (!capital || !riskPercent || !stopLossPercent) {
-          throw new Error('Usage: tv risk size <capital> <risk_percent> <stop_loss_percent>');
+          throw new Error('Usage: tv risk size <capital> <risk_percent> <stop_loss_percent> [-a available_capital]');
         }
-        return core.positionSize({ capital: Number(capital), riskPercent: Number(riskPercent), stopLossPercent: Number(stopLossPercent) });
+        return core.positionSize({
+          capital: Number(capital),
+          riskPercent: Number(riskPercent),
+          stopLossPercent: Number(stopLossPercent),
+          availableCapital: opts['available-capital'] ? Number(opts['available-capital']) : undefined,
+        });
       },
     }],
     ['rr', {
@@ -74,11 +82,12 @@ register('risk', {
         side: { type: 'string', short: 's', description: 'long (default) or short' },
         leverage: { type: 'string', short: 'l', description: 'Leverage multiplier (default 1)' },
         'win-rate': { type: 'string', short: 'w', description: 'Historical win rate % (enables breakeven check)' },
+        'available-capital': { type: 'string', short: 'a', description: 'Actual deployable balance — caps the recommended position size at what is executable' },
       },
       handler: (opts, positionals) => {
         const [capital, riskPercent, entry, stop, target] = positionals;
         if (!capital || !riskPercent || !entry || !stop || !target) {
-          throw new Error('Usage: tv risk gate <capital> <risk_percent> <entry> <stop> <target> [-s long|short] [-l leverage] [-w win_rate]');
+          throw new Error('Usage: tv risk gate <capital> <risk_percent> <entry> <stop> <target> [-s long|short] [-l leverage] [-w win_rate] [-a available_capital]');
         }
         return core.evaluateTradeSetup({
           capital: Number(capital),
@@ -89,6 +98,26 @@ register('risk', {
           target: Number(target),
           side: opts.side || 'long',
           historicalWinRate: opts['win-rate'] ? Number(opts['win-rate']) : undefined,
+          availableCapital: opts['available-capital'] ? Number(opts['available-capital']) : undefined,
+        });
+      },
+    }],
+    ['translate', {
+      description: 'Translate a directional plan ({side, entry}) into an executable order for spot/margin/futures (spot shorts -> sell held inventory)',
+      options: {
+        'account-type': { type: 'string', short: 't', description: 'spot (default), margin, or futures' },
+        'held-quantity': { type: 'string', short: 'q', description: 'Quantity of the asset currently held (default 0) — needed to translate a short onto spot' },
+      },
+      handler: (opts, positionals) => {
+        const [side, entry, positionSizeUsd] = positionals;
+        if (!side || !entry || !positionSizeUsd) {
+          throw new Error('Usage: tv risk translate <long|short> <entry> <position_size_usd> [-t spot|margin|futures] [-q held_quantity]');
+        }
+        return core.translateForAccount({
+          plan: { side, entry: Number(entry) },
+          accountType: opts['account-type'] || 'spot',
+          positionSizeUsd: Number(positionSizeUsd),
+          heldQuantity: opts['held-quantity'] ? Number(opts['held-quantity']) : 0,
         });
       },
     }],
