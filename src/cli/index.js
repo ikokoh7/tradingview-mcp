@@ -28,6 +28,7 @@ import './commands/stream.js';
 import './commands/binance.js';
 import './commands/binance_live.js';
 import './commands/risk.js';
+import './commands/sfp.js';
 
 // Run
 import { run } from './router.js';
