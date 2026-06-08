@@ -4,16 +4,20 @@
  * spot-account execution pass.
  *
  * Run on a timer (Windows Task Scheduler) — each invocation does ONE pass:
- * scans BTC/ETH/BNB on the 15m timeframe with FIVE independently-coded
+ * scans BTC/ETH/BNB on the 15m timeframe with SIX independently-coded
  * strategies — Swing Failure Pattern (close-based sweep confirmation),
  * RSI Divergence (close-based price/oscillator swing comparison),
  * Key Levels/Zones (consolidation-range breakout -> support/resistance
  * zone -> retest), Fibonacci golden-pocket reaction (retracement off
  * the most recent swing wicks into the 0.618-0.66 zone and rejects, the
- * same sweep-and-reject mechanic as SFP applied to a fib zone), and
+ * same sweep-and-reject mechanic as SFP applied to a fib zone),
  * Market Structure (BOS confirms the trend, then a CHoCH cycle's realigning
  * break — "the first green candle closing above the bullish CHoCH" — is the
- * entry trigger) — and requires CONFLUENCE: per the curriculum's repeated guidance that
+ * entry trigger), and Pinbar Reversal Bias (a long-wicked reversal candle
+ * forming AT the most recent swing extreme — "the end of a trend or a
+ * swing" — confirmed by a close-based retest of the candle-before's level,
+ * "the best entry for a pinbar is the retest of the low of the candle
+ * before the pinbar") — and requires CONFLUENCE: per the curriculum's repeated guidance that
  * complementary techniques produce more accurate setups ("adding further
  * confirmations leads to a more profitable setup"; SFP retests are "higher
  * conviction, not a lesser consolation entry"), a setup is only acted on
@@ -61,6 +65,7 @@ const { scanForDivergence, buildDivergenceTradePlan } = await import('../src/cor
 const { detectZones, findZoneRetests, buildZoneTradePlan } = await import('../src/core/levels.js');
 const { scanForFibReaction, buildFibTradePlan } = await import('../src/core/fibonacci.js');
 const { detectMarketStructure, buildStructureTradePlan } = await import('../src/core/market_structure.js');
+const { scanForPinbarSetup, buildPinbarTradePlan } = await import('../src/core/pinbar.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
 const { evaluateTradeSetup, translateForAccount } = await import('../src/core/risk.js');
 
@@ -241,6 +246,25 @@ function findFreshStructureSignal(klines, ctx, swingHighs, swingLows) {
   };
 }
 
+function findFreshPinbarSignal(klines, ctx, swingHighs, swingLows) {
+  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
+  const { hits } = scanForPinbarSetup(klines, { swingHighs, swingLows });
+  if (!hits.length) return null;
+  const hit = hits[hits.length - 1];
+  if (lastIndex - hit.index > FRESHNESS_BARS) return null;
+
+  const target = hit.direction === 'bullish' ? lastSwingHigh.price : lastSwingLow.price;
+  const alt = hit.direction === 'bullish' ? rangeHigh : rangeLow;
+  const plan = buildPinbarTradePlan({ hit, lastSwingLevel: target, rangeLevel: alt });
+  return {
+    strategy: 'pinbar',
+    plan,
+    confirmedAt: hit.bar.open_time,
+    signalKey: `pinbar:${hit.direction}:${hit.biasIndex}:${hit.bar.open_time}`,
+    summary: `${hit.direction} pinbar at swing extreme + level retest (entry ${plan.entry}, stop ${plan.stop})`,
+  };
+}
+
 const state = loadState();
 const account = await accountInfo();
 const balanceOf = (asset) => account.balances.find(b => b.asset === asset)?.free ?? 0;
@@ -277,7 +301,8 @@ for (const symbol of SYMBOLS) {
     const levelsSignal = findFreshLevelZoneSignal(klines, ctx);
     const fibSignal = findFreshFibSignal(klines, ctx);
     const structureSignal = findFreshStructureSignal(klines, ctx, swingHighs, swingLows);
-    const signals = [sfpSignal, divergenceSignal, levelsSignal, fibSignal, structureSignal].filter(Boolean);
+    const pinbarSignal = findFreshPinbarSignal(klines, ctx, swingHighs, swingLows);
+    const signals = [sfpSignal, divergenceSignal, levelsSignal, fibSignal, structureSignal, pinbarSignal].filter(Boolean);
 
     if (!signals.length) { log(`${symbol}: no fresh signals from any strategy within the last ${FRESHNESS_BARS} closed bars`); continue; }
 

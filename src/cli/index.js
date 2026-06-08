@@ -33,6 +33,7 @@ import './commands/divergence.js';
 import './commands/levels.js';
 import './commands/fibonacci.js';
 import './commands/market_structure.js';
+import './commands/pinbar.js';
 import './commands/confluence.js';
 
 // Run

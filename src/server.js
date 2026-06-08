@@ -22,6 +22,7 @@ import { registerDivergenceTools } from './tools/divergence.js';
 import { registerLevelsTools } from './tools/levels.js';
 import { registerFibonacciTools } from './tools/fibonacci.js';
 import { registerMarketStructureTools } from './tools/market_structure.js';
+import { registerPinbarTools } from './tools/pinbar.js';
 import { registerConfluenceTools } from './tools/confluence.js';
 
 const server = new McpServer(
@@ -101,6 +102,7 @@ registerDivergenceTools(server);
 registerLevelsTools(server);
 registerFibonacciTools(server);
 registerMarketStructureTools(server);
+registerPinbarTools(server);
 registerConfluenceTools(server);
 
 // Startup notice (stderr so it doesn't interfere with MCP stdio protocol)
