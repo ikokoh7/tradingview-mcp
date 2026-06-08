@@ -4,10 +4,11 @@
  * spot-account execution pass.
  *
  * Run on a timer (Windows Task Scheduler) — each invocation does ONE pass:
- * scans BTC/ETH/BNB on the 15m timeframe with TWO independently-coded
- * strategies — Swing Failure Pattern (close-based sweep confirmation) and
- * RSI Divergence (close-based price/oscillator swing comparison) — and
- * requires CONFLUENCE: per the curriculum's repeated guidance that
+ * scans BTC/ETH/BNB on the 15m timeframe with THREE independently-coded
+ * strategies — Swing Failure Pattern (close-based sweep confirmation),
+ * RSI Divergence (close-based price/oscillator swing comparison), and
+ * Key Levels/Zones (consolidation-range breakout -> support/resistance
+ * zone -> retest) — and requires CONFLUENCE: per the curriculum's repeated guidance that
  * complementary techniques produce more accurate setups ("adding further
  * confirmations leads to a more profitable setup"; SFP retests are "higher
  * conviction, not a lesser consolation entry"), a setup is only acted on
@@ -52,6 +53,7 @@ if (existsSync(envPath)) {
 const { getKlines, accountInfo, placeOrder } = await import('../src/core/binance.js');
 const { findSwingHighs, findSwingLows, scanForSFP, buildSFPTradePlan } = await import('../src/core/sfp.js');
 const { scanForDivergence, buildDivergenceTradePlan } = await import('../src/core/divergence.js');
+const { detectZones, findZoneRetests, buildZoneTradePlan } = await import('../src/core/levels.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
 const { evaluateTradeSetup, translateForAccount } = await import('../src/core/risk.js');
 
@@ -156,6 +158,36 @@ function findFreshDivergenceSignal(klines, ctx) {
   };
 }
 
+function findFreshLevelZoneSignal(klines, ctx) {
+  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
+  const zones = detectZones(klines);
+  const candidates = [];
+  for (const zone of zones) {
+    const hits = findZoneRetests(klines, zone);
+    if (hits.length) candidates.push({ zone, hit: hits[hits.length - 1] });
+  }
+  const fresh = candidates.filter(c => lastIndex - c.hit.index <= FRESHNESS_BARS);
+  if (!fresh.length) return null;
+
+  // If multiple zones were retested fresh (rare), the most recent retest wins.
+  fresh.sort((a, b) => b.hit.index - a.hit.index);
+  const { zone, hit } = fresh[0];
+  // "Buy support zones, sell resistance zones" (Ch.8) -> support retest targets
+  // the upside (last swing high / range high), resistance retest targets the
+  // downside (last swing low / range low) — same target convention as the
+  // other two strategies' "First Trouble Area" / range-level duality.
+  const target = zone.type === 'support' ? lastSwingHigh.price : lastSwingLow.price;
+  const alt = zone.type === 'support' ? rangeHigh : rangeLow;
+  const plan = buildZoneTradePlan({ zone, hit, oppositeZoneLevel: target, rangeLevel: alt });
+  return {
+    strategy: 'levels',
+    plan,
+    confirmedAt: hit.bar.open_time,
+    signalKey: `levels:${zone.type}:${zone.classification}:${hit.bar.open_time}`,
+    summary: `${zone.classification} ${zone.type} zone retest [${zone.low}-${zone.high}] (${hit.kind}, entry ${plan.entry}, stop ${plan.stop})`,
+  };
+}
+
 const state = loadState();
 const account = await accountInfo();
 const balanceOf = (asset) => account.balances.find(b => b.asset === asset)?.free ?? 0;
@@ -189,9 +221,10 @@ for (const symbol of SYMBOLS) {
     // lesser consolation entry"). One strategy alone is no longer sufficient.
     const sfpSignal = findFreshSFPSignal(klines, ctx);
     const divergenceSignal = findFreshDivergenceSignal(klines, ctx);
-    const signals = [sfpSignal, divergenceSignal].filter(Boolean);
+    const levelsSignal = findFreshLevelZoneSignal(klines, ctx);
+    const signals = [sfpSignal, divergenceSignal, levelsSignal].filter(Boolean);
 
-    if (!signals.length) { log(`${symbol}: no fresh signals from either strategy within the last ${FRESHNESS_BARS} closed bars`); continue; }
+    if (!signals.length) { log(`${symbol}: no fresh signals from any strategy within the last ${FRESHNESS_BARS} closed bars`); continue; }
 
     const confluence = assessConfluence({ signals });
     if (!confluence.confluence) {
