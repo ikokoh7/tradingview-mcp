@@ -4,3 +4,6 @@ scripts/current.pine
 temp_*
 *.log
 discovery-log.json
+trading_notes/
+.env
+auto_trade_state.json
