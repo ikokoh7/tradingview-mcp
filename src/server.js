@@ -18,6 +18,7 @@ import { registerBinanceTools } from './tools/binance.js';
 import { registerBinanceLiveTools } from './tools/binance_live.js';
 import { registerRiskTools } from './tools/risk.js';
 import { registerSfpTools } from './tools/sfp.js';
+import { registerDivergenceTools } from './tools/divergence.js';
 
 const server = new McpServer(
   {
@@ -92,6 +93,7 @@ registerBinanceTools(server);
 registerBinanceLiveTools(server);
 registerRiskTools(server);
 registerSfpTools(server);
+registerDivergenceTools(server);
 
 // Startup notice (stderr so it doesn't interfere with MCP stdio protocol)
 process.stderr.write('⚠  tradingview-mcp  |  Unofficial tool. Not affiliated with TradingView Inc. or Anthropic.\n');

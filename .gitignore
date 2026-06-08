@@ -7,3 +7,4 @@ discovery-log.json
 trading_notes/
 .env
 auto_trade_state.json
+.trade_watch_state.json
