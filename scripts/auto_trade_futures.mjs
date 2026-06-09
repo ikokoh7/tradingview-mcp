@@ -53,7 +53,7 @@ const INTERVAL_HTF      = '4h';
 const LEVERAGE          = 2;       // curriculum cap is 5x; 2x is the conservative starting point
 const MARGIN_TYPE       = 'ISOLATED';
 const RISK_PERCENT      = 1;
-const HISTORICAL_WIN_RATE = 51;
+const HISTORICAL_WIN_RATE = 62;  // measured: 29W/47 resolved trades, dual-TF with Ch.6 same-role guard
 const FRESHNESS_BARS    = 2;
 const HTF_FRESHNESS_BARS = 3;
 const LADDER_ORDERS     = 3;
@@ -156,32 +156,27 @@ function findFreshDivergenceSignal(klines4h, ctx4h) {
 function findFreshLevelZoneSignal(klines, ctx) {
   const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
   const zones = detectZones(klines);
-  if (!zones.length) return null;
-
   const candidates = [];
   for (const zone of zones) {
-    const retests = findZoneRetests(klines, zone);
-    for (const hit of retests) {
-      if (lastIndex - hit.bar_index <= FRESHNESS_BARS) {
-        candidates.push({ zone, hit });
-      }
-    }
+    const hits = findZoneRetests(klines, zone);
+    if (hits.length) candidates.push({ zone, hit: hits[hits.length - 1], touchCount: hits.length });
   }
-  if (!candidates.length) return null;
+  const fresh = candidates.filter(c => lastIndex - c.hit.index <= FRESHNESS_BARS);
+  if (!fresh.length) return null;
 
-  candidates.sort((a, b) => b.hit.bar_index - a.hit.bar_index);
-  const { zone, hit } = candidates[0];
-  const side = zone.type === 'support' ? 'long' : 'short';
-  const target = side === 'long' ? lastSwingHigh.price : lastSwingLow.price;
-  const alt    = side === 'long' ? rangeHigh : rangeLow;
-  const plan = buildZoneTradePlan({ zone, hit, lastSwingLevel: target, rangeLevel: alt });
-  const hitBar = klines[hit.bar_index];
+  fresh.sort((a, b) => b.hit.index - a.hit.index);
+  const { zone, hit, touchCount } = fresh[0];
+  const target = zone.type === 'support' ? lastSwingHigh.price : lastSwingLow.price;
+  const alt    = zone.type === 'support' ? rangeHigh : rangeLow;
+  const plan = buildZoneTradePlan({ zone, hit, oppositeZoneLevel: target, rangeLevel: alt });
   return {
     strategy: 'levels',
     plan,
-    confirmedAt: hitBar.open_time,
-    signalKey: `levels:${zone.type}:${zone.classification}:${hitBar.open_time}`,
+    confirmedAt: hit.bar.open_time,
+    signalKey: `levels:${zone.type}:${zone.classification}:${hit.bar.open_time}`,
     summary: `${zone.classification} ${zone.type} zone retest [${zone.low}-${zone.high}] (${hit.kind}, entry ${plan.entry}, stop ${plan.stop})`,
+    hitKind: hit.kind,
+    touchCount,
   };
 }
 
@@ -331,6 +326,24 @@ for (const symbol of SYMBOLS) {
     }
 
     log(`${symbol}: CONFLUENCE — ${confluence.confidence} (${signals.map(s => `${s.strategy}: ${s.summary}`).join(' | ')})`);
+
+    // Ch.6 same-role level entry rules (identical to spot bot):
+    // 2nd same-role touch → SFP required; 3rd+ touch → divergence required.
+    if (levelsSignal && confluence.agreeing_strategies.includes('levels') && levelsSignal.hitKind === 'retest') {
+      if (levelsSignal.touchCount >= 3) {
+        if (!confluence.agreeing_strategies.includes('divergence')) {
+          log(`${symbol}: levels zone has ${levelsSignal.touchCount} same-role touches — 3rd+ touch requires divergence confirmation (Ch.6), not present — standing down`);
+          state[symbol] = { last_signal_key: combinedKey, outcome: 'insufficient_confirmation' };
+          continue;
+        }
+      } else {
+        if (!confluence.agreeing_strategies.includes('sfp')) {
+          log(`${symbol}: levels is a same-role retest — SFP required by Ch.6 for non-flip retests, not present — standing down`);
+          state[symbol] = { last_signal_key: combinedKey, outcome: 'insufficient_confirmation' };
+          continue;
+        }
+      }
+    }
 
     const plan = confluence.plan;
 

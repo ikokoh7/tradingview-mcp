@@ -150,18 +150,21 @@ function findFreshLevelZoneSignal(klines, ctx) {
   const candidates = [];
   for (const zone of zones) {
     const hits = findZoneRetests(klines, zone);
-    if (hits.length) candidates.push({ zone, hit: hits[hits.length - 1] });
+    if (hits.length) candidates.push({ zone, hit: hits[hits.length - 1], touchCount: hits.length });
   }
   const fresh = candidates.filter(c => lastIndex - c.hit.index <= FRESHNESS_BARS);
   if (!fresh.length) return null;
   fresh.sort((a, b) => b.hit.index - a.hit.index);
-  const { zone, hit } = fresh[0];
+  const { zone, hit, touchCount } = fresh[0];
   const target = zone.type === 'support' ? lastSwingHigh.price : lastSwingLow.price;
   const alt    = zone.type === 'support' ? rangeHigh : rangeLow;
   const plan = buildZoneTradePlan({ zone, hit, oppositeZoneLevel: target, rangeLevel: alt });
   return { strategy: 'levels', plan, confirmedAt: hit.bar.open_time,
     signalKey: `levels:${zone.type}:${zone.classification}:${hit.bar.open_time}`,
-    summary: `${zone.classification} ${zone.type} zone retest [${zone.low}-${zone.high}] (${hit.kind})` };
+    summary: `${zone.classification} ${zone.type} zone retest [${zone.low}-${zone.high}] (${hit.kind})`,
+    hitKind: hit.kind,
+    touchCount,
+  };
 }
 
 function findFreshFibSignal(klines, ctx) {
@@ -284,6 +287,16 @@ async function backtestSymbol(symbol) {
     if (!signals.length) continue;
     const conf = assessConfluence({ signals });
     if (!conf.confluence) continue;
+
+    // Ch.6 same-role guard — mirrors auto_trade.mjs exactly
+    const levelsSignal = signals.find(s => s.strategy === 'levels');
+    if (levelsSignal && conf.agreeing_strategies.includes('levels') && levelsSignal.hitKind === 'retest') {
+      if (levelsSignal.touchCount >= 3) {
+        if (!conf.agreeing_strategies.includes('divergence')) continue;
+      } else {
+        if (!conf.agreeing_strategies.includes('sfp')) continue;
+      }
+    }
 
     const key = `${symbol}:${conf.agreeing_strategies.sort().join('+')}:` +
       signals.filter(s => conf.agreeing_strategies.includes(s.strategy))

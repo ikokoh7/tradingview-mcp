@@ -83,7 +83,7 @@ const SYMBOLS          = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
 const INTERVAL         = '15m';
 const INTERVAL_HTF     = '4h';   // Ch.10/11: divergence "minimum 4-hour timeframe"; Ch.3: pinbar is HTF bias
 const RISK_PERCENT     = 1;      // bottom of the curriculum's 1-3% per-trade cap
-const HISTORICAL_WIN_RATE = 51;  // measured: 501W/973 resolved trades, dual-TF (15m execution + 4H divergence/pinbar-bias)
+const HISTORICAL_WIN_RATE = 62;  // measured: 29W/47 resolved trades, dual-TF with Ch.6 same-role guard
 const FRESHNESS_BARS   = 2;      // 15m signals: act only on signals confirmed within the last N closed bars
 const HTF_FRESHNESS_BARS = 3;    // 4H signals: slightly wider window (3 × 4H = 12h)
 const LADDER_ORDERS    = 3;      // Ch.1's worked examples use 3 or 5 rungs — pick the smaller, conservative split
@@ -214,14 +214,14 @@ function findFreshLevelZoneSignal(klines, ctx) {
   const candidates = [];
   for (const zone of zones) {
     const hits = findZoneRetests(klines, zone);
-    if (hits.length) candidates.push({ zone, hit: hits[hits.length - 1] });
+    if (hits.length) candidates.push({ zone, hit: hits[hits.length - 1], touchCount: hits.length });
   }
   const fresh = candidates.filter(c => lastIndex - c.hit.index <= FRESHNESS_BARS);
   if (!fresh.length) return null;
 
   // If multiple zones were retested fresh (rare), the most recent retest wins.
   fresh.sort((a, b) => b.hit.index - a.hit.index);
-  const { zone, hit } = fresh[0];
+  const { zone, hit, touchCount } = fresh[0];
   // "Buy support zones, sell resistance zones" (Ch.8) -> support retest targets
   // the upside (last swing high / range high), resistance retest targets the
   // downside (last swing low / range low) — same target convention as the
@@ -235,6 +235,8 @@ function findFreshLevelZoneSignal(klines, ctx) {
     confirmedAt: hit.bar.open_time,
     signalKey: `levels:${zone.type}:${zone.classification}:${hit.bar.open_time}`,
     summary: `${zone.classification} ${zone.type} zone retest [${zone.low}-${zone.high}] (${hit.kind}, entry ${plan.entry}, stop ${plan.stop})`,
+    hitKind: hit.kind,
+    touchCount,
   };
 }
 
@@ -385,6 +387,30 @@ for (const symbol of SYMBOLS) {
     }
 
     log(`${symbol}: CONFLUENCE — ${confluence.confidence} (${signals.map(s => `${s.strategy}: ${s.summary}`).join(' | ')})`);
+
+    // Ch.6 same-role level entry rules:
+    // First retest (S/R flip, hit.kind==='first'): any 2+ confluence is valid — the role
+    // change itself is the confirmation. Same-role retests require additional gating:
+    //   2nd touch: SFP must be in the agreeing set (market makers run stops first; we
+    //              want to enter after the stop hunt, not before it — Ch.6).
+    //   3rd+ touch: level is weakening; divergence confirmation required to evidence
+    //               remaining momentum (MACD preferred by curriculum; RSI used here
+    //               as the closest encoded proxy — Ch.6).
+    if (levelsSignal && confluence.agreeing_strategies.includes('levels') && levelsSignal.hitKind === 'retest') {
+      if (levelsSignal.touchCount >= 3) {
+        if (!confluence.agreeing_strategies.includes('divergence')) {
+          log(`${symbol}: levels zone has ${levelsSignal.touchCount} same-role touches — 3rd+ touch requires divergence confirmation (Ch.6), not present — standing down`);
+          state[symbol] = { last_signal_key: combinedKey, outcome: 'insufficient_confirmation' };
+          continue;
+        }
+      } else {
+        if (!confluence.agreeing_strategies.includes('sfp')) {
+          log(`${symbol}: levels is a same-role retest — SFP required by Ch.6 for non-flip retests, not present — standing down`);
+          state[symbol] = { last_signal_key: combinedKey, outcome: 'insufficient_confirmation' };
+          continue;
+        }
+      }
+    }
 
     const plan = confluence.plan;
     const gate = evaluateTradeSetup({
