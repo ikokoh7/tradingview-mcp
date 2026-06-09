@@ -58,6 +58,12 @@ const FRESHNESS_BARS    = 2;
 const HTF_FRESHNESS_BARS = 3;
 const LADDER_ORDERS     = 3;
 const RSI_PERIOD        = 14;
+// Curriculum kill zones — institutional liquidity windows where clean moves form.
+// Outside these windows the bot stands down to avoid low-liquidity chop.
+const KILL_ZONES = [
+  { name: 'London Open', startUtc: 7,  endUtc: 10 },
+  { name: 'NY Open',     startUtc: 13, endUtc: 16 },
+];
 
 const STATE_PATH = join(ROOT, 'auto_trade_futures_state.json');
 const LOG_PATH   = join(ROOT, 'auto_trade_futures.log');
@@ -148,8 +154,8 @@ function findFreshDivergenceSignal(klines4h, ctx4h) {
     strategy: 'divergence',
     plan,
     confirmedAt: hit.newer_swing.bar.open_time,
-    signalKey: `divergence:${type}:${hit.newer_swing.bar.open_time}`,
-    summary: `4H ${hit.strength} ${type} divergence (entry ${plan.entry}, stop ${plan.stop})`,
+    signalKey: `divergence:${hit.pattern}:${type}:${hit.newer_swing.bar.open_time}`,
+    summary: `4H ${hit.pattern} ${type} divergence (entry ${plan.entry}, stop ${plan.stop})`,
   };
 }
 
@@ -181,19 +187,21 @@ function findFreshLevelZoneSignal(klines, ctx) {
 }
 
 function findFreshFibSignal(klines, ctx) {
-  const { lastSwingHigh, lastSwingLow, lastIndex } = ctx;
+  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
   if (lastSwingHigh.index === lastSwingLow.index) return null;
-  const result = scanForFibReaction(klines, { swingHigh: lastSwingHigh, swingLow: lastSwingLow });
-  if (!result?.hit) return null;
-  if (lastIndex - result.hit.bar_index > FRESHNESS_BARS) return null;
-  const plan = buildFibTradePlan({ result, swingHigh: lastSwingHigh, swingLow: lastSwingLow });
-  const hitBar = klines[result.hit.bar_index];
+  const { direction, hits } = scanForFibReaction(klines, { swingHigh: lastSwingHigh, swingLow: lastSwingLow });
+  if (!hits.length) return null;
+  const hit = hits[hits.length - 1];
+  if (lastIndex - hit.index > FRESHNESS_BARS) return null;
+  const target = direction === 'bullish' ? lastSwingHigh.price : lastSwingLow.price;
+  const alt    = direction === 'bullish' ? rangeHigh : rangeLow;
+  const plan = buildFibTradePlan({ hit, direction, lastSwingLevel: target, rangeLevel: alt });
   return {
     strategy: 'fibonacci',
     plan,
-    confirmedAt: hitBar.open_time,
-    signalKey: `fibonacci:${result.type}:${hitBar.open_time}`,
-    summary: `${result.type} golden-pocket reaction (${result.hit.kind}, entry ${plan.entry}, stop ${plan.stop})`,
+    confirmedAt: hit.bar.open_time,
+    signalKey: `fibonacci:${direction}:${hit.bar.open_time}`,
+    summary: `${direction} golden-pocket reaction (${hit.kind}, entry ${plan.entry}, stop ${plan.stop})`,
   };
 }
 
@@ -228,6 +236,24 @@ function findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) {
   return { direction: hit.direction };
 }
 
+function findFreshPinbarSignal(klines, ctx, swingHighs, swingLows) {
+  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
+  const { hits } = scanForPinbarSetup(klines, { swingHighs, swingLows });
+  if (!hits.length) return null;
+  const hit = hits[hits.length - 1];
+  if (lastIndex - hit.index > FRESHNESS_BARS) return null;
+  const target = hit.direction === 'bullish' ? lastSwingHigh.price : lastSwingLow.price;
+  const alt    = hit.direction === 'bullish' ? rangeHigh : rangeLow;
+  const plan = buildPinbarTradePlan({ hit, lastSwingLevel: target, rangeLevel: alt });
+  return {
+    strategy: 'pinbar',
+    plan,
+    confirmedAt: hit.bar.open_time,
+    signalKey: `pinbar:${hit.direction}:${hit.biasIndex}:${hit.bar.open_time}`,
+    summary: `${hit.direction} pinbar at swing extreme + level retest (entry ${plan.entry}, stop ${plan.stop})`,
+  };
+}
+
 
 // ---- Main scan --------------------------------------------------------------
 
@@ -244,6 +270,15 @@ try {
 
 const usdt = info.balances.find(b => b.asset === 'USDT')?.free ?? 0;
 log(`scan start — interval=${INTERVAL}/${INTERVAL_HTF} leverage=${LEVERAGE}x margin=${MARGIN_TYPE} symbols=${SYMBOLS.join(',')} usdt_balance=${usdt}`);
+
+const utcHour = new Date().getUTCHours();
+const activeSession = KILL_ZONES.find(z => utcHour >= z.startUtc && utcHour < z.endUtc);
+if (!activeSession) {
+  log(`outside kill zones (UTC ${utcHour}:xx) — London Open 07-10, NY Open 13-16 — no trades this scan`);
+  log('scan complete');
+  process.exit(0);
+}
+log(`${activeSession.name} kill zone active — proceeding`);
 
 for (const symbol of SYMBOLS) {
   try {
@@ -295,25 +330,36 @@ for (const symbol of SYMBOLS) {
       lastIndex: klines4h.length - 1,
     } : null;
 
-    const sfpSignal       = findFreshSFPSignal(klines, ctx);
-    const levelsSignal    = findFreshLevelZoneSignal(klines, ctx);
-    const fibSignal       = findFreshFibSignal(klines, ctx);
-    const structureSignal = findFreshStructureSignal(klines, ctx, swingHighs, swingLows);
+    const sfpSignal        = findFreshSFPSignal(klines, ctx);
+    const levelsSignal     = findFreshLevelZoneSignal(klines, ctx);
+    const fibSignal        = findFreshFibSignal(klines, ctx);
+    const structureSignal  = findFreshStructureSignal(klines, ctx, swingHighs, swingLows);
+    const pinbarSignal     = findFreshPinbarSignal(klines, ctx, swingHighs, swingLows);
     const divergenceSignal = ctx4h ? findFreshDivergenceSignal(klines4h, ctx4h) : null;
     const htfBias          = ctx4h ? findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) : null;
 
-    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, divergenceSignal].filter(Boolean);
+    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, pinbarSignal, divergenceSignal].filter(Boolean);
+
+    // 4H pinbar bias — filter opposing signals, with divergence+levels exemption.
+    // Same logic as the spot bot's daily bias exemption: a divergence+levels pair
+    // pointing counter to the 4H pinbar is a high-conviction reversal (Ch.6 + Ch.10/11)
+    // and should not be blocked on a futures account where both directions are valid.
     if (htfBias) {
-      const biasSide = htfBias.direction === 'bullish' ? 'long' : 'short';
+      const biasSide  = htfBias.direction === 'bullish' ? 'long' : 'short';
+      const otherSide = biasSide === 'long' ? 'short' : 'long';
+      const counterDiv    = signals.find(s => s.strategy === 'divergence' && s.plan.side === otherSide);
+      const counterLevels = signals.find(s => s.strategy === 'levels'     && s.plan.side === otherSide);
+      const exemptPair    = !!(counterDiv && counterLevels);
       const before = signals.length;
-      signals = signals.filter(s => s.plan.side === biasSide);
+      signals = signals.filter(s =>
+        s.plan.side === biasSide ||
+        (exemptPair && (s.strategy === 'divergence' || s.strategy === 'levels') && s.plan.side === otherSide)
+      );
       if (signals.length < before)
-        log(`${symbol}: 4H pinbar bias (${htfBias.direction}) filtered out ${before - signals.length} opposing signal(s)`);
+        log(`${symbol}: 4H pinbar bias (${htfBias.direction}) filtered out ${before - signals.length} opposing signal(s)${exemptPair ? ' — divergence+levels reversal pair exempted' : ''}`);
     }
 
-    // No daily bias filter for futures — both longs and shorts are valid entries.
-    // Counter-trend reversals (e.g. divergence+levels at key support in a bearish
-    // daily trend) are fully tradeable on a futures account.
+    // No daily bias filter — futures trades both directions freely.
 
     if (!signals.length) { log(`${symbol}: no fresh signals`); continue; }
 
