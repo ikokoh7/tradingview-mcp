@@ -68,7 +68,7 @@ if (existsSync(envPath)) {
   }
 }
 
-const { getKlines, accountInfo, placeOrder } = await import('../src/core/binance.js');
+const { getKlines, accountInfo, placeOrder, getOpenOrders } = await import('../src/core/binance.js');
 const { findSwingHighs, findSwingLows, scanForSFP, buildSFPTradePlan } = await import('../src/core/sfp.js');
 const { scanForDivergence, buildDivergenceTradePlan } = await import('../src/core/divergence.js');
 const { detectZones, findZoneRetests, buildZoneTradePlan } = await import('../src/core/levels.js');
@@ -317,11 +317,21 @@ log(`scan start — interval=${INTERVAL}/${INTERVAL_HTF} symbols=${SYMBOLS.join(
 
 for (const symbol of SYMBOLS) {
   try {
-    // Fetch both timeframes — 15m for execution signals, 4H for divergence + pinbar bias
-    const [{ klines: rawKlines }, { klines: rawKlines4h }] = await Promise.all([
+    // Fetch both timeframes + open orders in parallel.
+    // Open orders check: if a previous ladder is still sitting on the exchange,
+    // adding a new one would stack entries at the same zone — skip until the
+    // existing orders resolve (fill, cancel, or expire).
+    const [{ klines: rawKlines }, { klines: rawKlines4h }, { orders: openOrders }] = await Promise.all([
       getKlines({ symbol, interval: INTERVAL,     limit: 150 }),
       getKlines({ symbol, interval: INTERVAL_HTF, limit: 100 }),
+      getOpenOrders({ symbol }),
     ]);
+
+    if (openOrders.length > 0) {
+      log(`${symbol}: ${openOrders.length} open order(s) still active (IDs: ${openOrders.map(o => o.order_id).join(', ')}) — skipping to avoid stacking entries`);
+      continue;
+    }
+
     const now = Date.now();
     const klines   = rawKlines.filter(k => k.close_time <= now);
     const klines4h = rawKlines4h.filter(k => k.close_time <= now);
