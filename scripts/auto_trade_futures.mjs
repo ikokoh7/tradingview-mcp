@@ -198,35 +198,34 @@ function findFreshFibSignal(klines, ctx) {
 }
 
 function findFreshStructureSignal(klines, ctx, swingHighs, swingLows) {
-  const { lastIndex } = ctx;
-  const structure = detectMarketStructure(klines, swingHighs, swingLows);
-  if (!structure?.signal) return null;
-  const { signal } = structure;
-  if (lastIndex - signal.bar_index > FRESHNESS_BARS) return null;
-  const plan = buildStructureTradePlan({ signal, structure });
-  const signalBar = klines[signal.bar_index];
+  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
+  const { choch, trend } = detectMarketStructure(klines, { swingHighs, swingLows });
+  if (!trend || !choch.length) return null;
+
+  const realigning = choch.filter(c => c.direction === trend);
+  if (!realigning.length) return null;
+  const latest = realigning[realigning.length - 1];
+  if (lastIndex - latest.index > FRESHNESS_BARS) return null;
+
+  const target = trend === 'bullish' ? lastSwingHigh.price : lastSwingLow.price;
+  const alt    = trend === 'bullish' ? rangeHigh : rangeLow;
+  const plan = buildStructureTradePlan({ choch: latest, trend, lastSwingLevel: target, rangeLevel: alt });
   return {
-    strategy: 'structure',
+    strategy: 'market_structure',
     plan,
-    confirmedAt: signalBar.open_time,
-    signalKey: `structure:${signal.type}:${signalBar.open_time}`,
-    summary: `${signal.type} (entry ${plan.entry}, stop ${plan.stop})`,
+    confirmedAt: latest.bar.open_time,
+    signalKey: `market_structure:${trend}:choch${latest.sequenceNumber}:${latest.bar.open_time}`,
+    summary: `${trend} BOS + realigning CHoCH#${latest.sequenceNumber} (entry ${plan.entry}, stop ${plan.stop})`,
   };
 }
 
 function findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) {
   const { lastIndex } = ctx4h;
-  const candidates = [];
-  for (const type of ['bullish', 'bearish']) {
-    const result = scanForPinbarSetup(klines4h, swingHighs4h, swingLows4h, { type });
-    if (result?.hit && lastIndex - result.hit.bar_index <= HTF_FRESHNESS_BARS) {
-      candidates.push({ result, type });
-    }
-  }
-  if (!candidates.length) return null;
-  candidates.sort((a, b) => b.result.hit.bar_index - a.result.hit.bar_index);
-  const { type } = candidates[0];
-  return { direction: type === 'bullish' ? 'bullish' : 'bearish' };
+  const { hits } = scanForPinbarSetup(klines4h, { swingHighs: swingHighs4h, swingLows: swingLows4h });
+  if (!hits.length) return null;
+  const hit = hits[hits.length - 1];
+  if (lastIndex - hit.index > HTF_FRESHNESS_BARS) return null;
+  return { direction: hit.direction };
 }
 
 
