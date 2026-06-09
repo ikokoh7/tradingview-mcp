@@ -4,20 +4,25 @@
  * spot-account execution pass.
  *
  * Run on a timer (Windows Task Scheduler) — each invocation does ONE pass:
- * scans BTC/ETH/BNB on the 15m timeframe with SIX independently-coded
- * strategies — Swing Failure Pattern (close-based sweep confirmation),
- * RSI Divergence (close-based price/oscillator swing comparison),
- * Key Levels/Zones (consolidation-range breakout -> support/resistance
- * zone -> retest), Fibonacci golden-pocket reaction (retracement off
- * the most recent swing wicks into the 0.618-0.66 zone and rejects, the
- * same sweep-and-reject mechanic as SFP applied to a fib zone),
- * Market Structure (BOS confirms the trend, then a CHoCH cycle's realigning
- * break — "the first green candle closing above the bullish CHoCH" — is the
- * entry trigger), and Pinbar Reversal Bias (a long-wicked reversal candle
- * forming AT the most recent swing extreme — "the end of a trend or a
- * swing" — confirmed by a close-based retest of the candle-before's level,
- * "the best entry for a pinbar is the retest of the low of the candle
- * before the pinbar") — and requires CONFLUENCE: per the curriculum's repeated guidance that
+ * scans BTC/ETH/BNB on a dual-timeframe basis:
+ *
+ *   15m (execution timeframe) — four independently-coded strategies:
+ *     Swing Failure Pattern (close-based sweep confirmation),
+ *     Key Levels/Zones (consolidation-range breakout -> support/resistance
+ *     zone -> retest), Fibonacci golden-pocket reaction (retracement into
+ *     the 0.618-0.66 zone with close-based rejection), Market Structure
+ *     (BOS confirms trend, realigning CHoCH is the entry trigger).
+ *
+ *   4H (bias/confirmation timeframe) — two curriculum-specified HTF tools:
+ *     RSI Divergence ("a minimum 4-hour timeframe is preferred" — Ch.10/11),
+ *     run as a full confluence signal on 4H bars; and Pinbar Reversal Bias
+ *     (Ch.3 is titled "HTF Bias and LTF Execution" — the pinbar establishes
+ *     a directional bias on the higher timeframe, not an execution entry),
+ *     applied as a pre-confluence direction filter: if a fresh 4H pinbar is
+ *     present, only 15m/4H signals that agree with its direction are passed
+ *     to the confluence gate.
+ *
+ * Requires CONFLUENCE: per the curriculum's repeated guidance that
  * complementary techniques produce more accurate setups ("adding further
  * confirmations leads to a more profitable setup"; SFP retests are "higher
  * conviction, not a lesser consolation entry"), a setup is only acted on
@@ -74,13 +79,15 @@ const { buildLadderOrders } = await import('../src/core/laddering.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
 const { evaluateTradeSetup, translateForAccount } = await import('../src/core/risk.js');
 
-const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
-const INTERVAL = '15m';
-const RISK_PERCENT = 1; // bottom of the curriculum's 1-3% per-trade cap
-const HISTORICAL_WIN_RATE = 73; // measured: 762W/1051 resolved trades across BTC/ETH/BNB, ~2000 15m bars each
-const FRESHNESS_BARS = 2; // only act on signals confirmed within the last N closed bars
-const LADDER_ORDERS = 3; // Ch.1's worked examples ladder into 3 or 5 rungs — pick the smaller, more conservative split
-const RSI_PERIOD = 14; // curriculum default for divergence detection
+const SYMBOLS          = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+const INTERVAL         = '15m';
+const INTERVAL_HTF     = '4h';   // Ch.10/11: divergence "minimum 4-hour timeframe"; Ch.3: pinbar is HTF bias
+const RISK_PERCENT     = 1;      // bottom of the curriculum's 1-3% per-trade cap
+const HISTORICAL_WIN_RATE = 51;  // measured: 501W/973 resolved trades, dual-TF (15m execution + 4H divergence/pinbar-bias)
+const FRESHNESS_BARS   = 2;      // 15m signals: act only on signals confirmed within the last N closed bars
+const HTF_FRESHNESS_BARS = 3;    // 4H signals: slightly wider window (3 × 4H = 12h)
+const LADDER_ORDERS    = 3;      // Ch.1's worked examples use 3 or 5 rungs — pick the smaller, conservative split
+const RSI_PERIOD       = 14;     // curriculum default for divergence detection
 
 const STATE_PATH = join(ROOT, 'auto_trade_state.json');
 const LOG_PATH = join(ROOT, 'auto_trade.log');
@@ -148,32 +155,45 @@ function findFreshSFPSignal(klines, ctx) {
   };
 }
 
-function findFreshDivergenceSignal(klines, ctx) {
-  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
+// Runs on 4H bars — "a minimum 4-hour timeframe is preferred" (Ch.10/11).
+// klines4h / ctx4h are the HTF series; entry/stop/target in the returned plan
+// are 4H-level prices, but assessConfluence will pick the freshest signal's
+// plan, so the 15m strategy's plan almost always wins the execution slot.
+function findFreshDivergenceSignal(klines4h, ctx4h) {
+  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx4h;
   const candidates = [];
   for (const type of ['bullish', 'bearish']) {
-    const result = scanForDivergence(klines, { type, rsiPeriod: RSI_PERIOD });
+    const result = scanForDivergence(klines4h, { type, rsiPeriod: RSI_PERIOD });
     if (result.divergence) candidates.push({ hit: result, type });
   }
-  const fresh = candidates.filter(c => lastIndex - c.hit.newer_swing.index <= FRESHNESS_BARS);
+  const fresh = candidates.filter(c => lastIndex - c.hit.newer_swing.index <= HTF_FRESHNESS_BARS);
   if (!fresh.length) return null;
 
-  // If both directions are fresh (rare), the most recently confirmed swing wins.
   fresh.sort((a, b) => b.hit.newer_swing.index - a.hit.newer_swing.index);
   const { hit, type } = fresh[0];
-  // Bullish divergence predicts a bottom -> targets the upside (last swing high / range high);
-  // bearish predicts a top -> targets the downside (last swing low / range low) — same
-  // opposite-side-target convention as SFP's buildSFPTradePlan.
   const target = type === 'bullish' ? lastSwingHigh.price : lastSwingLow.price;
-  const alt = type === 'bullish' ? rangeHigh : rangeLow;
+  const alt    = type === 'bullish' ? rangeHigh : rangeLow;
   const plan = buildDivergenceTradePlan({ hit, lastSwingLevel: target, rangeLevel: alt });
   return {
     strategy: 'divergence',
     plan,
     confirmedAt: hit.newer_swing.bar.open_time,
     signalKey: `divergence:${hit.pattern}:${type}:${hit.newer_swing.bar.open_time}`,
-    summary: `${hit.pattern} ${type} divergence (entry ${plan.entry}, stop ${plan.stop})`,
+    summary: `4H ${hit.pattern} ${type} divergence (entry ${plan.entry}, stop ${plan.stop})`,
   };
+}
+
+// Ch.3 is "HTF Bias and LTF Execution" — the pinbar establishes directional
+// bias on the 4H, not an execution entry. Returns {direction} or null.
+// Applied as a pre-confluence filter: if present, opposing-direction 15m
+// signals are discarded before confluence assessment.
+function findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) {
+  const { lastIndex } = ctx4h;
+  const { hits } = scanForPinbarSetup(klines4h, { swingHighs: swingHighs4h, swingLows: swingLows4h });
+  if (!hits.length) return null;
+  const hit = hits[hits.length - 1];
+  if (lastIndex - hit.index > HTF_FRESHNESS_BARS) return null;
+  return { direction: hit.direction };
 }
 
 function findFreshLevelZoneSignal(klines, ctx) {
@@ -279,39 +299,63 @@ const account = await accountInfo();
 const balanceOf = (asset) => account.balances.find(b => b.asset === asset)?.free ?? 0;
 const usdt = balanceOf('USDT');
 
-log(`scan start — interval=${INTERVAL} symbols=${SYMBOLS.join(',')} usdt_balance=${usdt.toFixed(2)}`);
+log(`scan start — interval=${INTERVAL}/${INTERVAL_HTF} symbols=${SYMBOLS.join(',')} usdt_balance=${usdt.toFixed(2)}`);
 
 for (const symbol of SYMBOLS) {
   try {
-    const { klines: rawKlines } = await getKlines({ symbol, interval: INTERVAL, limit: 150 });
-    // Exclude the still-forming candle — its OHLC keeps changing until close_time
-    // passes, which would make signals flicker in and out between polls. Only
-    // confirmed, closed bars are stable enough to act on.
-    const klines = rawKlines.filter(k => k.close_time <= Date.now());
-    if (klines.length < 10) { log(`${symbol}: not enough closed bars yet — skipping`); continue; }
+    // Fetch both timeframes — 15m for execution signals, 4H for divergence + pinbar bias
+    const [{ klines: rawKlines }, { klines: rawKlines4h }] = await Promise.all([
+      getKlines({ symbol, interval: INTERVAL,     limit: 150 }),
+      getKlines({ symbol, interval: INTERVAL_HTF, limit: 100 }),
+    ]);
+    const now = Date.now();
+    const klines   = rawKlines.filter(k => k.close_time <= now);
+    const klines4h = rawKlines4h.filter(k => k.close_time <= now);
+
+    if (klines.length < 10) { log(`${symbol}: not enough closed 15m bars yet — skipping`); continue; }
+
+    // 15m swing points + context (execution signals)
     const swingHighs = findSwingHighs(klines, { lookback: 3 });
-    const swingLows = findSwingLows(klines, { lookback: 3 });
-    if (!swingHighs.length || !swingLows.length) { log(`${symbol}: no swing points established yet — skipping`); continue; }
+    const swingLows  = findSwingLows(klines,  { lookback: 3 });
+    if (!swingHighs.length || !swingLows.length) { log(`${symbol}: no 15m swing points established yet — skipping`); continue; }
 
     const lastSwingHigh = swingHighs[swingHighs.length - 1];
-    const lastSwingLow = swingLows[swingLows.length - 1];
+    const lastSwingLow  = swingLows[swingLows.length - 1];
     const rangeHigh = Math.max(...klines.map(k => k.high));
-    const rangeLow = Math.min(...klines.map(k => k.low));
+    const rangeLow  = Math.min(...klines.map(k => k.low));
     const lastIndex = klines.length - 1;
     const ctx = { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex };
 
-    // Run every coded strategy independently, then require AGREEMENT before
-    // acting — the curriculum is explicit that techniques COMPLEMENT each
-    // other for more accurate setups ("adding further confirmations leads to
-    // a more profitable setup"; SFP retests are "higher conviction, not a
-    // lesser consolation entry"). One strategy alone is no longer sufficient.
-    const sfpSignal = findFreshSFPSignal(klines, ctx);
-    const divergenceSignal = findFreshDivergenceSignal(klines, ctx);
-    const levelsSignal = findFreshLevelZoneSignal(klines, ctx);
-    const fibSignal = findFreshFibSignal(klines, ctx);
+    // 4H swing points + context (divergence signal + pinbar bias)
+    const swingHighs4h = klines4h.length >= 10 ? findSwingHighs(klines4h, { lookback: 3 }) : [];
+    const swingLows4h  = klines4h.length >= 10 ? findSwingLows(klines4h,  { lookback: 3 }) : [];
+    const ctx4h = (swingHighs4h.length && swingLows4h.length) ? {
+      lastSwingHigh: swingHighs4h[swingHighs4h.length - 1],
+      lastSwingLow:  swingLows4h[swingLows4h.length - 1],
+      rangeHigh: Math.max(...klines4h.map(k => k.high)),
+      rangeLow:  Math.min(...klines4h.map(k => k.low)),
+      lastIndex: klines4h.length - 1,
+    } : null;
+
+    // 15m execution signals (SFP, Levels, Fibonacci, Market Structure)
+    const sfpSignal       = findFreshSFPSignal(klines, ctx);
+    const levelsSignal    = findFreshLevelZoneSignal(klines, ctx);
+    const fibSignal       = findFreshFibSignal(klines, ctx);
     const structureSignal = findFreshStructureSignal(klines, ctx, swingHighs, swingLows);
-    const pinbarSignal = findFreshPinbarSignal(klines, ctx, swingHighs, swingLows);
-    const signals = [sfpSignal, divergenceSignal, levelsSignal, fibSignal, structureSignal, pinbarSignal].filter(Boolean);
+
+    // 4H signals (Divergence as full signal; Pinbar as direction-only bias filter)
+    const divergenceSignal = ctx4h ? findFreshDivergenceSignal(klines4h, ctx4h) : null;
+    const htfBias          = ctx4h ? findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) : null;
+
+    // Apply HTF pinbar bias: discard any signal whose direction opposes the 4H pinbar read
+    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, divergenceSignal].filter(Boolean);
+    if (htfBias) {
+      const biasSide = htfBias.direction === 'bullish' ? 'long' : 'short';
+      const before = signals.length;
+      signals = signals.filter(s => s.plan.side === biasSide);
+      if (signals.length < before)
+        log(`${symbol}: 4H pinbar bias (${htfBias.direction}) filtered out ${before - signals.length} opposing signal(s)`);
+    }
 
     if (!signals.length) { log(`${symbol}: no fresh signals from any strategy within the last ${FRESHNESS_BARS} closed bars`); continue; }
 

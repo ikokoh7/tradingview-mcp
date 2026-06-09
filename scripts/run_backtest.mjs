@@ -1,23 +1,21 @@
 #!/usr/bin/env node
 /**
  * Walk-forward backtesting harness — measures the real win rate of the
- * six-strategy confluence system so HISTORICAL_WIN_RATE in auto_trade.mjs
- * can be replaced with a measured number instead of the current placeholder.
+ * dual-timeframe confluence system so HISTORICAL_WIN_RATE in auto_trade.mjs
+ * can be replaced with a measured number instead of a placeholder.
  *
  * Methodology:
- *   For each symbol, fetch ~2000 closed 15m bars from the Binance MAINNET
- *   public API (no auth required). Walk forward bar by bar from bar 150
- *   onward. At each step, run all six strategy detectors on the trailing
- *   150-bar window (identical to what the live bot sees). When two or more
- *   strategies agree — confluence — record the trade. Simulate its outcome
- *   by walking the remaining bars: a trade wins when its close crosses the
- *   target, loses when its close crosses the stop (close-based throughout,
- *   consistent with the system's own entry discipline). Cap open trades at
- *   100 bars so the stats stay bounded.
+ *   For each symbol, fetch ~2000 closed 15m bars AND ~500 closed 4H bars
+ *   from the Binance MAINNET public API (no auth required). Walk forward
+ *   bar by bar from bar 150 onward. At each 15m bar, also build a trailing
+ *   100-bar 4H window of bars whose close_time precedes the current 15m
+ *   bar's open_time (time-aligned, no lookahead). Run signals exactly as
+ *   the live bot does: 15m execution signals (SFP, Levels, Fibonacci,
+ *   Market Structure); 4H divergence signal; 4H pinbar as a direction
+ *   filter. Simulate outcomes close-based; cap at 100 bars.
  *
- *   The risk gate is deliberately skipped here — we are measuring raw signal
- *   quality (what is the true win rate the risk gate should be calibrated
- *   against), not the post-filtered rate.
+ *   The risk gate is deliberately skipped — we are measuring raw signal
+ *   quality, not the post-filtered rate.
  *
  * Output:
  *   Console summary per symbol and overall.
@@ -43,13 +41,17 @@ const { detectMarketStructure, buildStructureTradePlan } = await import('../src/
 const { scanForPinbarSetup, buildPinbarTradePlan } = await import('../src/core/pinbar.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
 
-const SYMBOLS     = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
-const INTERVAL    = '15m';
-const WINDOW_SIZE = 150;   // trailing bar window — mirrors the live bot's limit
-const FRESHNESS_BARS = 2;  // same as auto_trade.mjs
-const RSI_PERIOD  = 14;    // curriculum default
-const MAX_HOLD    = 100;   // bars before marking a trade 'open' (unresolved)
-const PAGES       = 2;     // pages × 1000 bars = 2000 bars ≈ 20 days of 15m data
+const SYMBOLS          = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+const INTERVAL         = '15m';
+const INTERVAL_HTF     = '4h';
+const WINDOW_SIZE      = 150;   // trailing 15m window
+const HTF_WINDOW_SIZE  = 100;   // trailing 4H window
+const FRESHNESS_BARS   = 2;     // 15m freshness — same as auto_trade.mjs
+const HTF_FRESHNESS_BARS = 3;   // 4H freshness — same as auto_trade.mjs
+const RSI_PERIOD       = 14;
+const MAX_HOLD         = 100;   // 15m bars before marking a trade 'open'
+const PAGES            = 2;     // 2 × 1000 = 2000 15m bars ≈ 20 days
+const HTF_PAGES        = 1;     // 1 × 500 = 500 4H bars ≈ 83 days (covers well beyond 15m window)
 
 // ---- Mainnet public klines (no auth) ----------------------------------------
 
@@ -77,18 +79,18 @@ function fetchKlinesPage(symbol, interval, limit, endTime) {
   });
 }
 
-async function fetchHistory(symbol) {
+async function fetchHistory(symbol, interval, pages, limitPerPage = 1000) {
   let allBars = [];
   let endTime = undefined;
-  for (let p = 0; p < PAGES; p++) {
-    const page = await fetchKlinesPage(symbol, INTERVAL, 1000, endTime);
+  for (let p = 0; p < pages; p++) {
+    const page = await fetchKlinesPage(symbol, interval, limitPerPage, endTime);
     if (!page.length) break;
-    allBars = [...page, ...allBars];     // oldest-first
-    endTime = page[0].open_time - 1;    // next page ends just before this one
+    allBars = [...page, ...allBars];
+    endTime = page[0].open_time - 1;
   }
   allBars.sort((a, b) => a.open_time - b.open_time);
   const now = Date.now();
-  return allBars.filter(k => k.close_time <= now); // closed bars only
+  return allBars.filter(k => k.close_time <= now);
 }
 
 // ---- Signal detectors (identical logic to auto_trade.mjs) -------------------
@@ -112,14 +114,15 @@ function findFreshSFPSignal(klines, ctx) {
     summary: `${type} SFP (${hit.kind}, entry ${plan.entry}, stop ${plan.stop})` };
 }
 
-function findFreshDivergenceSignal(klines, ctx) {
-  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
+// Runs on 4H bars — mirrors auto_trade.mjs's findFreshDivergenceSignal
+function findFreshDivergenceSignal(klines4h, ctx4h) {
+  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx4h;
   const candidates = [];
   for (const type of ['bullish', 'bearish']) {
-    const result = scanForDivergence(klines, { type, rsiPeriod: RSI_PERIOD });
+    const result = scanForDivergence(klines4h, { type, rsiPeriod: RSI_PERIOD });
     if (result.divergence) candidates.push({ hit: result, type });
   }
-  const fresh = candidates.filter(c => lastIndex - c.hit.newer_swing.index <= FRESHNESS_BARS);
+  const fresh = candidates.filter(c => lastIndex - c.hit.newer_swing.index <= HTF_FRESHNESS_BARS);
   if (!fresh.length) return null;
   fresh.sort((a, b) => b.hit.newer_swing.index - a.hit.newer_swing.index);
   const { hit, type } = fresh[0];
@@ -128,7 +131,17 @@ function findFreshDivergenceSignal(klines, ctx) {
   const plan = buildDivergenceTradePlan({ hit, lastSwingLevel: target, rangeLevel: alt });
   return { strategy: 'divergence', plan, confirmedAt: hit.newer_swing.bar.open_time,
     signalKey: `divergence:${hit.pattern}:${type}:${hit.newer_swing.bar.open_time}`,
-    summary: `${hit.pattern} ${type} divergence (entry ${plan.entry}, stop ${plan.stop})` };
+    summary: `4H ${hit.pattern} ${type} divergence (entry ${plan.entry}, stop ${plan.stop})` };
+}
+
+// Returns {direction} or null — 4H pinbar as a bias filter, not a signal
+function findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) {
+  const { lastIndex } = ctx4h;
+  const { hits } = scanForPinbarSetup(klines4h, { swingHighs: swingHighs4h, swingLows: swingLows4h });
+  if (!hits.length) return null;
+  const hit = hits[hits.length - 1];
+  if (lastIndex - hit.index > HTF_FRESHNESS_BARS) return null;
+  return { direction: hit.direction };
 }
 
 function findFreshLevelZoneSignal(klines, ctx) {
@@ -181,24 +194,12 @@ function findFreshStructureSignal(klines, ctx, swingHighs, swingLows) {
     summary: `${trend} CHoCH entry (entry ${plan.entry}, stop ${plan.stop})` };
 }
 
-function findFreshPinbarSignal(klines, ctx, swingHighs, swingLows) {
-  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
-  const { hits } = scanForPinbarSetup(klines, { swingHighs, swingLows });
-  if (!hits.length) return null;
-  const hit = hits[hits.length - 1];
-  if (lastIndex - hit.index > FRESHNESS_BARS) return null;
-  const target = hit.direction === 'bullish' ? lastSwingHigh.price : lastSwingLow.price;
-  const alt    = hit.direction === 'bullish' ? rangeHigh : rangeLow;
-  const plan = buildPinbarTradePlan({ hit, lastSwingLevel: target, rangeLevel: alt });
-  return { strategy: 'pinbar', plan, confirmedAt: hit.bar.open_time,
-    signalKey: `pinbar:${hit.direction}:${hit.biasIndex}:${hit.bar.open_time}`,
-    summary: `${hit.direction} pinbar at swing extreme + level retest (entry ${plan.entry}, stop ${plan.stop})` };
-}
+// Pinbar is now HTF bias only — see findHTFPinbarBias above
 
 // ---- Outcome simulation ------------------------------------------------------
 
 function simulateOutcome(allBars, { entry, stop, target, side, startIndex }) {
-  const isLong = String(side).toUpperCase() === 'BUY';
+  const isLong = side === 'long';
   for (let i = startIndex + 1; i < allBars.length && i <= startIndex + MAX_HOLD; i++) {
     const close = allBars[i].close;
     if (isLong) {
@@ -216,19 +217,31 @@ function simulateOutcome(allBars, { entry, stop, target, side, startIndex }) {
 
 async function backtestSymbol(symbol) {
   process.stdout.write(`${symbol}: fetching history... `);
-  const allBars = await fetchHistory(symbol);
-  console.log(`${allBars.length} closed bars`);
+  const [allBars, allBars4h] = await Promise.all([
+    fetchHistory(symbol, INTERVAL,     PAGES,     1000),
+    fetchHistory(symbol, INTERVAL_HTF, HTF_PAGES, 500),
+  ]);
+  console.log(`${allBars.length} × 15m, ${allBars4h.length} × 4H closed bars`);
 
   const trades = [];
   const seenKeys = new Set();
 
   for (let i = WINDOW_SIZE; i < allBars.length; i++) {
-    const klines = allBars.slice(i - WINDOW_SIZE + 1, i + 1);
-    let swingHighs, swingLows, ctx, signals, confluence;
+    const currentOpenTime = allBars[i].open_time;
 
+    // 15m window
+    const klines = allBars.slice(i - WINDOW_SIZE + 1, i + 1);
+
+    // 4H window: bars whose close_time is strictly before this 15m bar's open_time
+    // (no lookahead — only closed 4H bars available at the time of this 15m bar)
+    const closedBars4h = allBars4h.filter(b => b.close_time < currentOpenTime);
+    const klines4h = closedBars4h.slice(-HTF_WINDOW_SIZE);
+
+    let signals;
     try {
-      swingHighs = findSwingHighs(klines, { lookback: 3 });
-      swingLows  = findSwingLows(klines, { lookback: 3 });
+      // 15m context
+      const swingHighs = findSwingHighs(klines, { lookback: 3 });
+      const swingLows  = findSwingLows(klines,  { lookback: 3 });
       if (!swingHighs.length || !swingLows.length) continue;
 
       const lastSwingHigh = swingHighs[swingHighs.length - 1];
@@ -236,22 +249,42 @@ async function backtestSymbol(symbol) {
       const rangeHigh = Math.max(...klines.map(k => k.high));
       const rangeLow  = Math.min(...klines.map(k => k.low));
       const lastIndex = klines.length - 1;
-      ctx = { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex };
+      const ctx = { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex };
 
+      // 4H context (if enough bars)
+      const swingHighs4h = klines4h.length >= 10 ? findSwingHighs(klines4h, { lookback: 3 }) : [];
+      const swingLows4h  = klines4h.length >= 10 ? findSwingLows(klines4h,  { lookback: 3 }) : [];
+      const ctx4h = (swingHighs4h.length && swingLows4h.length) ? {
+        lastSwingHigh: swingHighs4h[swingHighs4h.length - 1],
+        lastSwingLow:  swingLows4h[swingLows4h.length - 1],
+        rangeHigh: Math.max(...klines4h.map(k => k.high)),
+        rangeLow:  Math.min(...klines4h.map(k => k.low)),
+        lastIndex: klines4h.length - 1,
+      } : null;
+
+      // 15m execution signals
       const sfpSig       = findFreshSFPSignal(klines, ctx);
-      const divSig       = findFreshDivergenceSignal(klines, ctx);
       const levelsSig    = findFreshLevelZoneSignal(klines, ctx);
       const fibSig       = findFreshFibSignal(klines, ctx);
       const structureSig = findFreshStructureSignal(klines, ctx, swingHighs, swingLows);
-      const pinbarSig    = findFreshPinbarSignal(klines, ctx, swingHighs, swingLows);
-      signals = [sfpSig, divSig, levelsSig, fibSig, structureSig, pinbarSig].filter(Boolean);
+
+      // 4H signals
+      const divSig    = ctx4h ? findFreshDivergenceSignal(klines4h, ctx4h) : null;
+      const htfBias   = ctx4h ? findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) : null;
+
+      // Apply HTF pinbar direction filter
+      let candidates = [sfpSig, levelsSig, fibSig, structureSig, divSig].filter(Boolean);
+      if (htfBias) {
+        const biasSide = htfBias.direction === 'bullish' ? 'long' : 'short';
+        candidates = candidates.filter(s => s.plan.side === biasSide);
+      }
+      signals = candidates;
     } catch { continue; }
 
     if (!signals.length) continue;
     const conf = assessConfluence({ signals });
     if (!conf.confluence) continue;
 
-    // Dedup — same confluence can span several sequential bars while still fresh
     const key = `${symbol}:${conf.agreeing_strategies.sort().join('+')}:` +
       signals.filter(s => conf.agreeing_strategies.includes(s.strategy))
              .map(s => s.signalKey).sort().join(',');
