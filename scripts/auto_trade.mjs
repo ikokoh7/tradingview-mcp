@@ -82,8 +82,9 @@ const { evaluateTradeSetup, translateForAccount } = await import('../src/core/ri
 const SYMBOLS          = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
 const INTERVAL         = '15m';
 const INTERVAL_HTF     = '4h';   // Ch.10/11: divergence "minimum 4-hour timeframe"; Ch.3: pinbar is HTF bias
+const INTERVAL_DAILY   = '1d';   // macro structural bias — daily BOS/CHoCH establishes the trend filters below
 const RISK_PERCENT     = 1;      // bottom of the curriculum's 1-3% per-trade cap
-const HISTORICAL_WIN_RATE = 62;  // measured: 29W/47 resolved trades, dual-TF with Ch.6 same-role guard
+const HISTORICAL_WIN_RATE = 58;  // measured: 32W/55 resolved trades, dual-TF + Ch.6 guard + daily bias (div+levels exempted)
 const FRESHNESS_BARS   = 2;      // 15m signals: act only on signals confirmed within the last N closed bars
 const HTF_FRESHNESS_BARS = 3;    // 4H signals: slightly wider window (3 × 4H = 12h)
 const LADDER_ORDERS    = 3;      // Ch.1's worked examples use 3 or 5 rungs — pick the smaller, conservative split
@@ -208,6 +209,21 @@ function findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) {
   return { direction: hit.direction };
 }
 
+// Daily structure bias — establishes macro trend direction from 50 daily bars
+// using the same BOS/CHoCH market structure engine as the 15m signal.
+// No freshness check needed: unlike the 4H pinbar (a recent event), the daily
+// trend is the trend until a new BOS invalidates it. Returns {direction} or
+// null if the daily structure is ranging/inconclusive (no filter applied then).
+function findDailyStructureBias(klines1d) {
+  if (klines1d.length < 10) return null;
+  const swingHighs1d = findSwingHighs(klines1d, { lookback: 3 });
+  const swingLows1d  = findSwingLows(klines1d,  { lookback: 3 });
+  if (!swingHighs1d.length || !swingLows1d.length) return null;
+  const { trend } = detectMarketStructure(klines1d, { swingHighs: swingHighs1d, swingLows: swingLows1d });
+  if (!trend) return null;
+  return { direction: trend };
+}
+
 function findFreshLevelZoneSignal(klines, ctx) {
   const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
   const zones = detectZones(klines);
@@ -321,9 +337,10 @@ for (const symbol of SYMBOLS) {
     // Open orders check: if a previous ladder is still sitting on the exchange,
     // adding a new one would stack entries at the same zone — skip until the
     // existing orders resolve (fill, cancel, or expire).
-    const [{ klines: rawKlines }, { klines: rawKlines4h }, { orders: openOrders }] = await Promise.all([
-      getKlines({ symbol, interval: INTERVAL,     limit: 150 }),
-      getKlines({ symbol, interval: INTERVAL_HTF, limit: 100 }),
+    const [{ klines: rawKlines }, { klines: rawKlines4h }, { klines: rawKlines1d }, { orders: openOrders }] = await Promise.all([
+      getKlines({ symbol, interval: INTERVAL,       limit: 150 }),
+      getKlines({ symbol, interval: INTERVAL_HTF,   limit: 100 }),
+      getKlines({ symbol, interval: INTERVAL_DAILY, limit: 50  }),
       getOpenOrders({ symbol }),
     ]);
 
@@ -335,6 +352,7 @@ for (const symbol of SYMBOLS) {
     const now = Date.now();
     const klines   = rawKlines.filter(k => k.close_time <= now);
     const klines4h = rawKlines4h.filter(k => k.close_time <= now);
+    const klines1d = rawKlines1d.filter(k => k.close_time <= now);
 
     if (klines.length < 10) { log(`${symbol}: not enough closed 15m bars yet — skipping`); continue; }
 
@@ -379,6 +397,27 @@ for (const symbol of SYMBOLS) {
       signals = signals.filter(s => s.plan.side === biasSide);
       if (signals.length < before)
         log(`${symbol}: 4H pinbar bias (${htfBias.direction}) filtered out ${before - signals.length} opposing signal(s)`);
+    }
+
+    // Apply daily structure bias: discard signals opposing the macro daily trend.
+    // Exception: a divergence+levels pair pointing the same counter-trend direction
+    // is exempt — the curriculum explicitly validates divergence at a key zone as a
+    // high-conviction reversal regardless of the macro trend (Ch.6 + Ch.10/11).
+    // All other counter-trend signals (lone SFP, fibonacci, etc.) are still removed.
+    const dailyBias = findDailyStructureBias(klines1d);
+    if (dailyBias) {
+      const biasSide  = dailyBias.direction === 'bullish' ? 'long' : 'short';
+      const otherSide = biasSide === 'long' ? 'short' : 'long';
+      const counterDiv    = signals.find(s => s.strategy === 'divergence' && s.plan.side === otherSide);
+      const counterLevels = signals.find(s => s.strategy === 'levels'     && s.plan.side === otherSide);
+      const exemptPair    = !!(counterDiv && counterLevels);
+      const before = signals.length;
+      signals = signals.filter(s =>
+        s.plan.side === biasSide ||
+        (exemptPair && (s.strategy === 'divergence' || s.strategy === 'levels') && s.plan.side === otherSide)
+      );
+      if (signals.length < before)
+        log(`${symbol}: daily structure bias (${dailyBias.direction}) filtered out ${before - signals.length} opposing signal(s)${exemptPair ? ' — divergence+levels reversal pair exempted' : ''}`);
     }
 
     if (!signals.length) { log(`${symbol}: no fresh signals from any strategy within the last ${FRESHNESS_BARS} closed bars`); continue; }

@@ -52,6 +52,8 @@ const RSI_PERIOD       = 14;
 const MAX_HOLD         = 100;   // 15m bars before marking a trade 'open'
 const PAGES            = 2;     // 2 × 1000 = 2000 15m bars ≈ 20 days
 const HTF_PAGES        = 1;     // 1 × 500 = 500 4H bars ≈ 83 days (covers well beyond 15m window)
+const DAILY_WINDOW_SIZE = 50;   // trailing daily window — ~50 trading days of macro context
+const DAILY_PAGES      = 1;     // 1 × 50 = 50 daily bars (single small fetch)
 
 // ---- Mainnet public klines (no auth) ----------------------------------------
 
@@ -144,6 +146,17 @@ function findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) {
   return { direction: hit.direction };
 }
 
+// Returns {direction} or null — daily BOS/CHoCH establishes macro trend bias
+function findDailyStructureBias(klines1d) {
+  if (klines1d.length < 10) return null;
+  const swingHighs1d = findSwingHighs(klines1d, { lookback: 3 });
+  const swingLows1d  = findSwingLows(klines1d,  { lookback: 3 });
+  if (!swingHighs1d.length || !swingLows1d.length) return null;
+  const { trend } = detectMarketStructure(klines1d, { swingHighs: swingHighs1d, swingLows: swingLows1d });
+  if (!trend) return null;
+  return { direction: trend };
+}
+
 function findFreshLevelZoneSignal(klines, ctx) {
   const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
   const zones = detectZones(klines);
@@ -220,11 +233,12 @@ function simulateOutcome(allBars, { entry, stop, target, side, startIndex }) {
 
 async function backtestSymbol(symbol) {
   process.stdout.write(`${symbol}: fetching history... `);
-  const [allBars, allBars4h] = await Promise.all([
-    fetchHistory(symbol, INTERVAL,     PAGES,     1000),
-    fetchHistory(symbol, INTERVAL_HTF, HTF_PAGES, 500),
+  const [allBars, allBars4h, allBars1d] = await Promise.all([
+    fetchHistory(symbol, INTERVAL,     PAGES,       1000),
+    fetchHistory(symbol, INTERVAL_HTF, HTF_PAGES,   500),
+    fetchHistory(symbol, '1d',         DAILY_PAGES, 50),
   ]);
-  console.log(`${allBars.length} × 15m, ${allBars4h.length} × 4H closed bars`);
+  console.log(`${allBars.length} × 15m, ${allBars4h.length} × 4H, ${allBars1d.length} × 1D closed bars`);
 
   const trades = [];
   const seenKeys = new Set();
@@ -239,6 +253,10 @@ async function backtestSymbol(symbol) {
     // (no lookahead — only closed 4H bars available at the time of this 15m bar)
     const closedBars4h = allBars4h.filter(b => b.close_time < currentOpenTime);
     const klines4h = closedBars4h.slice(-HTF_WINDOW_SIZE);
+
+    // Daily window: same no-lookahead alignment
+    const closedBars1d = allBars1d.filter(b => b.close_time < currentOpenTime);
+    const klines1d = closedBars1d.slice(-DAILY_WINDOW_SIZE);
 
     let signals;
     try {
@@ -275,11 +293,23 @@ async function backtestSymbol(symbol) {
       const divSig    = ctx4h ? findFreshDivergenceSignal(klines4h, ctx4h) : null;
       const htfBias   = ctx4h ? findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) : null;
 
-      // Apply HTF pinbar direction filter
+      // Apply HTF pinbar direction filter, then daily structure bias
       let candidates = [sfpSig, levelsSig, fibSig, structureSig, divSig].filter(Boolean);
       if (htfBias) {
         const biasSide = htfBias.direction === 'bullish' ? 'long' : 'short';
         candidates = candidates.filter(s => s.plan.side === biasSide);
+      }
+      const dailyBias = findDailyStructureBias(klines1d);
+      if (dailyBias) {
+        const biasSide  = dailyBias.direction === 'bullish' ? 'long' : 'short';
+        const otherSide = biasSide === 'long' ? 'short' : 'long';
+        const counterDiv    = candidates.find(s => s.strategy === 'divergence' && s.plan.side === otherSide);
+        const counterLevels = candidates.find(s => s.strategy === 'levels'     && s.plan.side === otherSide);
+        const exemptPair    = !!(counterDiv && counterLevels);
+        candidates = candidates.filter(s =>
+          s.plan.side === biasSide ||
+          (exemptPair && (s.strategy === 'divergence' || s.strategy === 'levels') && s.plan.side === otherSide)
+        );
       }
       signals = candidates;
     } catch { continue; }

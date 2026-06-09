@@ -53,7 +53,7 @@ const INTERVAL_HTF      = '4h';
 const LEVERAGE          = 2;       // curriculum cap is 5x; 2x is the conservative starting point
 const MARGIN_TYPE       = 'ISOLATED';
 const RISK_PERCENT      = 1;
-const HISTORICAL_WIN_RATE = 62;  // measured: 29W/47 resolved trades, dual-TF with Ch.6 same-role guard
+const HISTORICAL_WIN_RATE = 58;  // measured: 32W/55 resolved trades, dual-TF + Ch.6 guard + daily bias (div+levels exempted)
 const FRESHNESS_BARS    = 2;
 const HTF_FRESHNESS_BARS = 3;
 const LADDER_ORDERS     = 3;
@@ -229,6 +229,7 @@ function findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) {
   return { direction: type === 'bullish' ? 'bullish' : 'bearish' };
 }
 
+
 // ---- Main scan --------------------------------------------------------------
 
 const state = loadState();
@@ -262,14 +263,15 @@ for (const symbol of SYMBOLS) {
       state[symbol] = { ...state[symbol], outcome: 'closed', closed_at: new Date().toISOString() };
     }
 
-    // Fetch klines
+    // Fetch klines — futures trades both directions so no daily bias filter;
+    // only 15m execution TF and 4H for divergence + pinbar bias are needed.
     const [{ klines: rawKlines }, { klines: rawKlines4h }] = await Promise.all([
       getKlines({ symbol, interval: INTERVAL,     limit: 150 }),
       getKlines({ symbol, interval: INTERVAL_HTF, limit: 100 }),
     ]);
 
     // Drop the still-forming bar (last bar is incomplete)
-    const klines  = rawKlines.slice(0, -1);
+    const klines   = rawKlines.slice(0, -1);
     const klines4h = rawKlines4h.slice(0, -1);
 
     const swingHighs = findSwingHighs(klines,  { lookback: 3 });
@@ -309,6 +311,10 @@ for (const symbol of SYMBOLS) {
       if (signals.length < before)
         log(`${symbol}: 4H pinbar bias (${htfBias.direction}) filtered out ${before - signals.length} opposing signal(s)`);
     }
+
+    // No daily bias filter for futures — both longs and shorts are valid entries.
+    // Counter-trend reversals (e.g. divergence+levels at key support in a bearish
+    // daily trend) are fully tradeable on a futures account.
 
     if (!signals.length) { log(`${symbol}: no fresh signals`); continue; }
 
