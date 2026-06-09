@@ -114,13 +114,25 @@ async function getSymbolFilters(symbol) {
   const filters = data.symbols[0].filters;
   const lot = filters.find(f => f.filterType === 'LOT_SIZE');
   const notional = filters.find(f => f.filterType === 'NOTIONAL' || f.filterType === 'MIN_NOTIONAL');
-  return { stepSize: Number(lot.stepSize), minQty: Number(lot.minQty), minNotional: Number(notional?.minNotional ?? 0) };
+  const priceFilter = filters.find(f => f.filterType === 'PRICE_FILTER');
+  return {
+    stepSize: Number(lot.stepSize),
+    minQty: Number(lot.minQty),
+    minNotional: Number(notional?.minNotional ?? 0),
+    tickSize: Number(priceFilter?.tickSize ?? 0.01),
+  };
 }
 
 function floorToStep(quantity, step) {
   const decimals = Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
   const factor = 10 ** decimals;
   return Number((Math.floor(quantity * factor) / factor).toFixed(decimals));
+}
+
+function roundToTick(price, tick) {
+  const decimals = Math.max(0, -Math.floor(Math.log10(tick) + 1e-9));
+  const factor = 10 ** decimals;
+  return Number((Math.round(price * factor) / factor).toFixed(decimals));
 }
 
 // ---- Strategy detectors --------------------------------------------------
@@ -426,9 +438,13 @@ for (const symbol of SYMBOLS) {
     let ladder = null;
     if (ladderHigh > ladderLow) {
       const built = buildLadderOrders({ side: exec.order_side.toLowerCase(), totalSize: quantity, priceLow: ladderLow, priceHigh: ladderHigh, numOrders: LADDER_ORDERS });
-      const rungs = built.orders.map(o => ({ price: o.price, size: floorToStep(o.size, filters.stepSize) }));
+      const rungs = built.orders.map(o => ({ price: roundToTick(o.price, filters.tickSize), size: floorToStep(o.size, filters.stepSize) }));
       if (rungs.every(r => r.size >= filters.minQty && r.size * r.price >= filters.minNotional)) ladder = rungs;
     }
+
+    // Commit dedup key before placing orders — prevents re-fire if a rung throws
+    state[symbol] = { last_signal_key: combinedKey, outcome: 'executing', executed_at: new Date().toISOString() };
+    saveState(state);
 
     if (ladder) {
       log(`${symbol}: EXECUTING ${exec.order_side} ${quantity} ${asset} laddered into ${ladder.length} limit orders ` +
@@ -437,18 +453,22 @@ for (const symbol of SYMBOLS) {
 
       const orders = [];
       for (const rung of ladder) {
-        const order = await placeOrder({ symbol, side: exec.order_side, type: 'LIMIT', quantity: rung.size, price: rung.price });
-        log(`${symbol}: order result — ${JSON.stringify(order)}`);
-        orders.push(order);
+        try {
+          const order = await placeOrder({ symbol, side: exec.order_side, type: 'LIMIT', quantity: rung.size, price: rung.price });
+          log(`${symbol}: order result — ${JSON.stringify(order)}`);
+          orders.push(order);
+        } catch (err) {
+          log(`${symbol}: ladder rung FAILED (price ${rung.price}, qty ${rung.size}) — ${err.message}`);
+        }
       }
-      state[symbol] = { last_signal_key: combinedKey, outcome: 'executed', orders, executed_at: new Date().toISOString() };
+      state[symbol] = { ...state[symbol], outcome: 'executed', orders };
     } else {
       log(`${symbol}: EXECUTING ${exec.order_side} ${quantity} ${asset} @ ~${plan.entry} — ` +
           `${confluence.confidence}, R:R 1:${gate.reward_per_risk.toFixed(2)}, gate passed (${exec.note})`);
 
       const order = await placeOrder({ symbol, side: exec.order_side, type: 'MARKET', quantity });
       log(`${symbol}: order result — ${JSON.stringify(order)}`);
-      state[symbol] = { last_signal_key: combinedKey, outcome: 'executed', order, executed_at: new Date().toISOString() };
+      state[symbol] = { ...state[symbol], outcome: 'executed', orders: [order] };
     }
   } catch (err) {
     log(`${symbol}: ERROR — ${err.message}`);
