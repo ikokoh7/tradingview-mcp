@@ -208,6 +208,9 @@ function findFreshLevelZoneSignal(klines, ctx) {
 
 function findFreshFibSignal(klines, ctx) {
   const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
+  // Same-index swing points mean price is too compressed to anchor a fib swing —
+  // no valid A→B measurement is possible, so skip rather than throwing.
+  if (lastSwingHigh.index === lastSwingLow.index) return null;
   const { direction, hits } = scanForFibReaction(klines, { swingHigh: lastSwingHigh, swingLow: lastSwingLow });
   if (!hits.length) return null;
   const hit = hits[hits.length - 1];
