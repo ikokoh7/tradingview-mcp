@@ -146,7 +146,15 @@ export function findZoneRetests(bars, zone) {
   for (let i = zone.breakout_index + 1; i < bars.length; i++) {
     const bar = bars[i];
     const overlaps = bar.low <= zone.high && bar.high >= zone.low;
-    if (overlaps) hits.push({ index: i, kind: hits.length === 0 ? 'first' : 'retest', bar });
+    if (!overlaps) continue;
+    // Close-based confirmation: resistance must close ≤ zone.high (rejected at
+    // ceiling); support must close ≥ zone.low (held at floor). A close beyond
+    // the zone boundary means price broke through, not retested — same
+    // close-based principle as SFP and Fibonacci.
+    const confirmsDirection = zone.type === 'resistance'
+      ? bar.close <= zone.high
+      : bar.close >= zone.low;
+    if (confirmsDirection) hits.push({ index: i, kind: hits.length === 0 ? 'first' : 'retest', bar });
   }
   return hits;
 }
