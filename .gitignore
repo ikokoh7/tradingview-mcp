@@ -8,3 +8,4 @@ trading_notes/
 .env
 auto_trade_state.json
 .trade_watch_state.json
+backtest_cache/
