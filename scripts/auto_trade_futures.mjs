@@ -54,7 +54,7 @@ const INTERVAL_HTF      = '4h';
 const LEVERAGE          = 2;       // curriculum cap is 5x; 2x is the conservative starting point
 const MARGIN_TYPE       = 'ISOLATED';
 const RISK_PERCENT      = 1;
-const HISTORICAL_WIN_RATE = 69;  // measured: 25W/36 resolved trades, futures backtest — kill zones + no daily bias + pinbar signal
+const HISTORICAL_WIN_RATE = 66;  // measured: 33W/50 resolved trades, futures backtest now incl. CVD divergence + VWAP/VPVR filters (2026-06-12). Lowered from 69 (pre-CVD) — stricter, accurate breakeven R:R
 const FRESHNESS_BARS    = 2;
 const HTF_FRESHNESS_BARS = 3;
 const LADDER_ORDERS     = 3;
@@ -393,21 +393,26 @@ for (const symbol of SYMBOLS) {
     // No daily bias filter — futures trades both directions freely.
 
     // Ch.17 VWAP hard rule: "above VWAP, don't short; below VWAP, don't long"
-    // — evaluated on the 15m execution timeframe (same TF as the trade trigger).
+    // — evaluated on the 15m execution timeframe. Ch.17 explicitly carves out
+    // 4H swing trades ("The rules don't apply if you are taking swing trades on
+    // the 4H timeframe"), so the 4H RSI divergence signal is exempt — a 15m
+    // VWAP read must not veto an HTF swing setup.
     const vwapBias = classifyVWAPBias(klines);
     if (vwapBias.bias) {
       const before = signals.length;
-      signals = signals.filter(s => s.plan.side === vwapBias.bias);
+      signals = signals.filter(s => s.strategy === 'divergence' || s.plan.side === vwapBias.bias);
       if (signals.length < before)
         log(`${symbol}: VWAP bias (close ${vwapBias.close} vs vwap ${vwapBias.vwap.toFixed(2)}, bias=${vwapBias.bias}) filtered out ${before - signals.length} opposing signal(s)`);
     }
 
     // Ch.14 VPVR hard rule: "above VaH, look for shorts; below VaL, look for longs"
     // — value area computed over the same 15m visible range used for rangeHigh/rangeLow.
+    // VPVR is "one of the best LTF tools to hand you a bias" (Ch.14) — a lower-TF
+    // fair-value read, so it too exempts the 4H RSI divergence swing signal.
     const valueAreaBias = classifyValueAreaBias(klines);
     if (valueAreaBias.bias) {
       const before = signals.length;
-      signals = signals.filter(s => s.plan.side === valueAreaBias.bias);
+      signals = signals.filter(s => s.strategy === 'divergence' || s.plan.side === valueAreaBias.bias);
       if (signals.length < before)
         log(`${symbol}: VPVR value-area bias (close ${valueAreaBias.close} ${valueAreaBias.position} VA [${valueAreaBias.val.toFixed(2)}-${valueAreaBias.vah.toFixed(2)}], bias=${valueAreaBias.bias}) filtered out ${before - signals.length} opposing signal(s)`);
     }

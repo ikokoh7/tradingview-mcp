@@ -34,7 +34,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
 
 const { findSwingHighs, findSwingLows, scanForSFP, buildSFPTradePlan } = await import('../src/core/sfp.js');
-const { scanForDivergence, buildDivergenceTradePlan } = await import('../src/core/divergence.js');
+const { scanForDivergence, scanForCVDDivergence, buildDivergenceTradePlan } = await import('../src/core/divergence.js');
 const { detectZones, findZoneRetests, buildZoneTradePlan } = await import('../src/core/levels.js');
 const { scanForFibReaction, buildFibTradePlan } = await import('../src/core/fibonacci.js');
 const { detectMarketStructure, buildStructureTradePlan } = await import('../src/core/market_structure.js');
@@ -50,6 +50,7 @@ const HTF_WINDOW_SIZE  = 100;   // trailing 4H window
 const FRESHNESS_BARS   = 2;     // 15m freshness — same as auto_trade.mjs
 const HTF_FRESHNESS_BARS = 3;   // 4H freshness — same as auto_trade.mjs
 const RSI_PERIOD       = 14;
+const CVD_WINDOW       = 14;    // rolling-window size for CVD divergence — same as auto_trade.mjs
 const MAX_HOLD         = 100;   // 15m bars before marking a trade 'open'
 const PAGES            = 2;     // 2 × 1000 = 2000 15m bars ≈ 20 days
 const HTF_PAGES        = 1;     // 1 × 500 = 500 4H bars ≈ 83 days (covers well beyond 15m window)
@@ -168,6 +169,26 @@ function findFreshDivergenceSignal(klines4h, ctx4h) {
   return { strategy: 'divergence', plan, confirmedAt: hit.newer_swing.bar.open_time,
     signalKey: `divergence:${hit.pattern}:${type}:${hit.newer_swing.bar.open_time}`,
     summary: `4H ${hit.pattern} ${type} divergence (entry ${plan.entry}, stop ${plan.stop})` };
+}
+
+// Runs on 15m bars — mirrors auto_trade.mjs's findFreshCVDDivergenceSignal
+function findFreshCVDDivergenceSignal(klines, ctx) {
+  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
+  const candidates = [];
+  for (const type of ['bullish', 'bearish']) {
+    const result = scanForCVDDivergence(klines, { type, cvdWindow: CVD_WINDOW });
+    if (result.divergence) candidates.push({ hit: result, type });
+  }
+  const fresh = candidates.filter(c => lastIndex - c.hit.newer_swing.index <= FRESHNESS_BARS);
+  if (!fresh.length) return null;
+  fresh.sort((a, b) => b.hit.newer_swing.index - a.hit.newer_swing.index);
+  const { hit, type } = fresh[0];
+  const target = type === 'bullish' ? lastSwingHigh.price : lastSwingLow.price;
+  const alt    = type === 'bullish' ? rangeHigh : rangeLow;
+  const plan = buildDivergenceTradePlan({ hit, lastSwingLevel: target, rangeLevel: alt });
+  return { strategy: 'cvd_divergence', plan, confirmedAt: hit.newer_swing.bar.open_time,
+    signalKey: `cvd_divergence:${hit.pattern}:${type}:${hit.newer_swing.bar.open_time}`,
+    summary: `15m ${hit.pattern} ${type} CVD divergence (entry ${plan.entry}, stop ${plan.stop})` };
 }
 
 // Returns {direction} or null — 4H pinbar as a bias filter, not a signal
@@ -322,13 +343,14 @@ async function backtestSymbol(symbol) {
       const levelsSig    = findFreshLevelZoneSignal(klines, ctx);
       const fibSig       = findFreshFibSignal(klines, ctx);
       const structureSig = findFreshStructureSignal(klines, ctx, swingHighs, swingLows);
+      const cvdDivSig    = findFreshCVDDivergenceSignal(klines, ctx);
 
       // 4H signals
       const divSig    = ctx4h ? findFreshDivergenceSignal(klines4h, ctx4h) : null;
       const htfBias   = ctx4h ? findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) : null;
 
       // Apply HTF pinbar direction filter, then daily structure bias
-      let candidates = [sfpSig, levelsSig, fibSig, structureSig, divSig].filter(Boolean);
+      let candidates = [sfpSig, levelsSig, fibSig, structureSig, divSig, cvdDivSig].filter(Boolean);
       if (htfBias) {
         const biasSide = htfBias.direction === 'bullish' ? 'long' : 'short';
         candidates = candidates.filter(s => s.plan.side === biasSide);
@@ -345,11 +367,13 @@ async function backtestSymbol(symbol) {
           (exemptPair && (s.strategy === 'divergence' || s.strategy === 'levels') && s.plan.side === otherSide)
         );
       }
-      // Ch.17 VWAP hard rule + Ch.14 VPVR Value Area rule — same as auto_trade.mjs
+      // Ch.17 VWAP hard rule + Ch.14 VPVR Value Area rule — same as auto_trade.mjs.
+      // Both are LTF fair-value reads and exempt the 4H RSI divergence swing signal
+      // (Ch.17: rules "don't apply if you are taking swing trades on the 4H timeframe").
       const vwapBias = classifyVWAPBias(klines);
-      if (vwapBias.bias) candidates = candidates.filter(s => s.plan.side === vwapBias.bias);
+      if (vwapBias.bias) candidates = candidates.filter(s => s.strategy === 'divergence' || s.plan.side === vwapBias.bias);
       const valueAreaBias = classifyValueAreaBias(klines);
-      if (valueAreaBias.bias) candidates = candidates.filter(s => s.plan.side === valueAreaBias.bias);
+      if (valueAreaBias.bias) candidates = candidates.filter(s => s.strategy === 'divergence' || s.plan.side === valueAreaBias.bias);
 
       signals = candidates;
     } catch { continue; }

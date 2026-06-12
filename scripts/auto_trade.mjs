@@ -85,7 +85,7 @@ const INTERVAL         = '15m';
 const INTERVAL_HTF     = '4h';   // Ch.10/11: divergence "minimum 4-hour timeframe"; Ch.3: pinbar is HTF bias
 const INTERVAL_DAILY   = '1d';   // macro structural bias — daily BOS/CHoCH establishes the trend filters below
 const RISK_PERCENT     = 1;      // bottom of the curriculum's 1-3% per-trade cap
-const HISTORICAL_WIN_RATE = 58;  // measured: 32W/55 resolved trades, dual-TF + Ch.6 guard + daily bias (div+levels exempted)
+const HISTORICAL_WIN_RATE = 58;  // measured: 32W/55 resolved trades, dual-TF + Ch.6 guard + daily bias (div+levels exempted). NOTE: CVD-inclusive backtest (2026-06-12) now measures 65% (24W/37) — held at 58 deliberately (raising would loosen the risk gate; defer to review)
 const FRESHNESS_BARS   = 2;      // 15m signals: act only on signals confirmed within the last N closed bars
 const HTF_FRESHNESS_BARS = 3;    // 4H signals: slightly wider window (3 × 4H = 12h)
 const LADDER_ORDERS    = 3;      // Ch.1's worked examples use 3 or 5 rungs — pick the smaller, conservative split
@@ -452,21 +452,26 @@ for (const symbol of SYMBOLS) {
     }
 
     // Ch.17 VWAP hard rule: "above VWAP, don't short; below VWAP, don't long"
-    // — evaluated on the 15m execution timeframe (same TF as the trade trigger).
+    // — evaluated on the 15m execution timeframe. Ch.17 explicitly carves out
+    // 4H swing trades ("The rules don't apply if you are taking swing trades on
+    // the 4H timeframe"), so the 4H RSI divergence signal is exempt — a 15m
+    // VWAP read must not veto an HTF swing setup.
     const vwapBias = classifyVWAPBias(klines);
     if (vwapBias.bias) {
       const before = signals.length;
-      signals = signals.filter(s => s.plan.side === vwapBias.bias);
+      signals = signals.filter(s => s.strategy === 'divergence' || s.plan.side === vwapBias.bias);
       if (signals.length < before)
         log(`${symbol}: VWAP bias (close ${vwapBias.close} vs vwap ${vwapBias.vwap.toFixed(2)}, bias=${vwapBias.bias}) filtered out ${before - signals.length} opposing signal(s)`);
     }
 
     // Ch.14 VPVR hard rule: "above VaH, look for shorts; below VaL, look for longs"
     // — value area computed over the same 15m visible range used for rangeHigh/rangeLow.
+    // VPVR is "one of the best LTF tools to hand you a bias" (Ch.14) — a lower-TF
+    // fair-value read, so it too exempts the 4H RSI divergence swing signal.
     const valueAreaBias = classifyValueAreaBias(klines);
     if (valueAreaBias.bias) {
       const before = signals.length;
-      signals = signals.filter(s => s.plan.side === valueAreaBias.bias);
+      signals = signals.filter(s => s.strategy === 'divergence' || s.plan.side === valueAreaBias.bias);
       if (signals.length < before)
         log(`${symbol}: VPVR value-area bias (close ${valueAreaBias.close} ${valueAreaBias.position} VA [${valueAreaBias.val.toFixed(2)}-${valueAreaBias.vah.toFixed(2)}], bias=${valueAreaBias.bias}) filtered out ${before - signals.length} opposing signal(s)`);
     }
