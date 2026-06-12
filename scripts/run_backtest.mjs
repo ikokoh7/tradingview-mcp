@@ -40,6 +40,7 @@ const { scanForFibReaction, buildFibTradePlan } = await import('../src/core/fibo
 const { detectMarketStructure, buildStructureTradePlan } = await import('../src/core/market_structure.js');
 const { scanForPinbarSetup, buildPinbarTradePlan } = await import('../src/core/pinbar.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
+const { classifyVWAPBias, classifyValueAreaBias } = await import('../src/core/volume_profile.js');
 
 const SYMBOLS          = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
 const INTERVAL         = '15m';
@@ -344,6 +345,12 @@ async function backtestSymbol(symbol) {
           (exemptPair && (s.strategy === 'divergence' || s.strategy === 'levels') && s.plan.side === otherSide)
         );
       }
+      // Ch.17 VWAP hard rule + Ch.14 VPVR Value Area rule — same as auto_trade.mjs
+      const vwapBias = classifyVWAPBias(klines);
+      if (vwapBias.bias) candidates = candidates.filter(s => s.plan.side === vwapBias.bias);
+      const valueAreaBias = classifyValueAreaBias(klines);
+      if (valueAreaBias.bias) candidates = candidates.filter(s => s.plan.side === valueAreaBias.bias);
+
       signals = candidates;
     } catch { continue; }
 

@@ -25,6 +25,7 @@ import { registerMarketStructureTools } from './tools/market_structure.js';
 import { registerPinbarTools } from './tools/pinbar.js';
 import { registerLadderingTools } from './tools/laddering.js';
 import { registerConfluenceTools } from './tools/confluence.js';
+import { registerVolumeProfileTools } from './tools/volume_profile.js';
 
 const server = new McpServer(
   {
@@ -106,6 +107,7 @@ registerMarketStructureTools(server);
 registerPinbarTools(server);
 registerLadderingTools(server);
 registerConfluenceTools(server);
+registerVolumeProfileTools(server);
 
 // Startup notice (stderr so it doesn't interfere with MCP stdio protocol)
 process.stderr.write('⚠  tradingview-mcp  |  Unofficial tool. Not affiliated with TradingView Inc. or Anthropic.\n');

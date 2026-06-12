@@ -45,6 +45,7 @@ const { detectMarketStructure, buildStructureTradePlan } = await import('../src/
 const { scanForPinbarSetup, buildPinbarTradePlan } = await import('../src/core/pinbar.js');
 const { buildLadderOrders } = await import('../src/core/laddering.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
+const { classifyVWAPBias, classifyValueAreaBias } = await import('../src/core/volume_profile.js');
 const { evaluateTradeSetup, translateForAccount } = await import('../src/core/risk.js');
 
 const SYMBOLS           = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
@@ -390,6 +391,26 @@ for (const symbol of SYMBOLS) {
     }
 
     // No daily bias filter — futures trades both directions freely.
+
+    // Ch.17 VWAP hard rule: "above VWAP, don't short; below VWAP, don't long"
+    // — evaluated on the 15m execution timeframe (same TF as the trade trigger).
+    const vwapBias = classifyVWAPBias(klines);
+    if (vwapBias.bias) {
+      const before = signals.length;
+      signals = signals.filter(s => s.plan.side === vwapBias.bias);
+      if (signals.length < before)
+        log(`${symbol}: VWAP bias (close ${vwapBias.close} vs vwap ${vwapBias.vwap.toFixed(2)}, bias=${vwapBias.bias}) filtered out ${before - signals.length} opposing signal(s)`);
+    }
+
+    // Ch.14 VPVR hard rule: "above VaH, look for shorts; below VaL, look for longs"
+    // — value area computed over the same 15m visible range used for rangeHigh/rangeLow.
+    const valueAreaBias = classifyValueAreaBias(klines);
+    if (valueAreaBias.bias) {
+      const before = signals.length;
+      signals = signals.filter(s => s.plan.side === valueAreaBias.bias);
+      if (signals.length < before)
+        log(`${symbol}: VPVR value-area bias (close ${valueAreaBias.close} ${valueAreaBias.position} VA [${valueAreaBias.val.toFixed(2)}-${valueAreaBias.vah.toFixed(2)}], bias=${valueAreaBias.bias}) filtered out ${before - signals.length} opposing signal(s)`);
+    }
 
     if (!signals.length) { log(`${symbol}: no fresh signals`); continue; }
 

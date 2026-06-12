@@ -36,6 +36,7 @@ import './commands/market_structure.js';
 import './commands/pinbar.js';
 import './commands/laddering.js';
 import './commands/confluence.js';
+import './commands/volume_profile.js';
 
 // Run
 import { run } from './router.js';
