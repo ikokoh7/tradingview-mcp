@@ -70,6 +70,38 @@ register('divergence', {
         });
       },
     }],
+    ['cvd', {
+      description: 'Calculate rolling-window Cumulative Volume Delta over a JSON bar array (bars need volume + taker_buy_volume)',
+      options: {
+        window: { type: 'string', short: 'w', description: 'Rolling window size in bars (default 14)' },
+      },
+      handler: (opts, positionals) => {
+        const [barsJson] = positionals;
+        if (!barsJson) throw new Error('Usage: tv divergence cvd <bars_json> [-w window]');
+        return { cvd: core.calculateCVD(parseBars(barsJson), { window: opts.window ? Number(opts.window) : undefined }) };
+      },
+    }],
+    ['scan-cvd', {
+      description: 'Scan a JSON bar array for CVD divergence (bullish=lows only, bearish=highs only); classifies strong/medium/weak/hidden',
+      options: {
+        type: { type: 'string', short: 't', description: 'bullish (look for a bottom via lows) or bearish (look for a top via highs)' },
+        'cvd-window': { type: 'string', description: 'Rolling window size in bars for CVD (default 14)' },
+        lookback: { type: 'string', short: 'l', description: 'Bars on each side required to confirm a swing point (default 2)' },
+        tolerance: { type: 'string', description: 'Percent tolerance for "equal" extremes / double tops-bottoms (default 0.05)' },
+        'include-hidden': { type: 'string', description: 'true or false (default) — include continuation-signal hidden divergences' },
+      },
+      handler: (opts, positionals) => {
+        const [barsJson] = positionals;
+        if (!barsJson || !opts.type) throw new Error('Usage: tv divergence scan-cvd <bars_json> -t bullish|bearish [--cvd-window n] [-l lookback] [--tolerance pct] [--include-hidden true|false]');
+        return core.scanForCVDDivergence(parseBars(barsJson), {
+          type: opts.type,
+          cvdWindow: opts['cvd-window'] ? Number(opts['cvd-window']) : undefined,
+          lookback: opts.lookback ? Number(opts.lookback) : undefined,
+          tolerancePercent: opts.tolerance ? Number(opts.tolerance) : undefined,
+          includeHidden: opts['include-hidden'] === 'true',
+        });
+      },
+    }],
     ['plan', {
       description: 'Build a trade plan {side,entry,stop,target,alternate_target,pattern,confidence} from a confirmed divergence hit',
       options: {

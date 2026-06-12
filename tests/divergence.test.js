@@ -10,11 +10,17 @@ import {
   findCloseSwingLows,
   classifyDivergence,
   scanForDivergence,
+  calculateCVD,
+  scanForCVDDivergence,
   buildDivergenceTradePlan,
 } from '../src/core/divergence.js';
 
 function bar({ open, high, low, close }) {
   return { open, high, low, close };
+}
+
+function cvdBar({ close, volume, taker_buy_volume }) {
+  return { open: close, high: close + 1, low: close - 1, close, volume, taker_buy_volume };
 }
 
 describe('calculateRSI()', () => {
@@ -224,6 +230,95 @@ describe('scanForDivergence()', () => {
     } else {
       assert.deepEqual(withoutHidden.divergence, withHidden.divergence);
     }
+  });
+});
+
+describe('calculateCVD()', () => {
+  it('returns null for the warm-up period and rolling-window sums after', () => {
+    // volume === taker_buy_volume for every bar, so delta_i = 2*tb_i - vol_i = tb_i,
+    // i.e. delta == [1,2,3,4,5]. window=2 -> cvd[0]=null, cvd[i]=delta[i-1]+delta[i].
+    const deltas = [1, 2, 3, 4, 5];
+    const bars = deltas.map(d => cvdBar({ close: 100, volume: d, taker_buy_volume: d }));
+    const cvd = calculateCVD(bars, { window: 2 });
+    assert.equal(cvd[0], null);
+    assert.equal(cvd[1], 3);
+    assert.equal(cvd[2], 5);
+    assert.equal(cvd[3], 7);
+    assert.equal(cvd[4], 9);
+  });
+
+  it('returns all-null when the series is shorter than the window', () => {
+    const bars = [1, 2].map(d => cvdBar({ close: 100, volume: d, taker_buy_volume: d }));
+    const cvd = calculateCVD(bars, { window: 5 });
+    assert.deepEqual(cvd, [null, null]);
+  });
+
+  it('rejects a non-positive-integer window', () => {
+    assert.throws(() => calculateCVD([cvdBar({ close: 100, volume: 1, taker_buy_volume: 1 })], { window: 0 }));
+  });
+});
+
+describe('scanForCVDDivergence()', () => {
+  it('rejects an unknown type', () => {
+    const bars = [100, 101].map(close => cvdBar({ close, volume: 10, taker_buy_volume: 5 }));
+    assert.throws(() => scanForCVDDivergence(bars, { type: 'sideways' }));
+  });
+
+  it('reports no divergence when too few swing points exist yet (short series)', () => {
+    const bars = [100, 102, 99, 101, 98].map(close => cvdBar({ close, volume: 10, taker_buy_volume: 5 }));
+    const result = scanForCVDDivergence(bars, { type: 'bullish', cvdWindow: 2, lookback: 1 });
+    assert.equal(result.divergence, false);
+  });
+
+  it('detects a strong bullish divergence: price makes a lower low while CVD makes a higher low', () => {
+    // Same close series/shape as the scanForDivergence "strong" hand-built case
+    // (swing lows at idx 2, 4, 6 with lookback 1; compare the last two: idx4 -> idx6).
+    const closes = [100, 103, 96, 103, 97, 103, 95, 103, 98];
+    // volume constant at 10; taker_buy_volume chosen so delta = 2*tb - 10:
+    //   idx3,4 -> tb=2.5 -> delta=-5 each -> cvd[4] = delta[3]+delta[4] = -10
+    //   idx5,6 -> tb=7.5 -> delta=+5 each -> cvd[6] = delta[5]+delta[6] = +10
+    const takerBuy = [5, 5, 5, 2.5, 2.5, 7.5, 7.5, 5, 5];
+    const bars = closes.map((close, i) => cvdBar({ close, volume: 10, taker_buy_volume: takerBuy[i] }));
+    const result = scanForCVDDivergence(bars, { type: 'bullish', cvdWindow: 2, lookback: 1 });
+
+    assert.equal(result.divergence, true);
+    assert.equal(result.pattern, 'strong');
+    assert.equal(result.price_step, 'lower');
+    assert.equal(result.cvd_step, 'higher');
+    assert.equal(result.older_cvd, -10);
+    assert.equal(result.newer_cvd, 10);
+    assert.ok(Array.isArray(result.cvd_values));
+    assert.equal(result.cvd_values.length, bars.length);
+    // Generic RSI-named fields from classifyDivergence must not leak through.
+    assert.equal('rsi_step' in result, false);
+    assert.equal('older_rsi' in result, false);
+    assert.equal('newer_rsi' in result, false);
+    assert.equal('rsi_values' in result, false);
+  });
+
+  it('excludes hidden divergences by default but can include them on request', () => {
+    const closes = [100, 95, 99, 100];
+    const bars = closes.map(close => cvdBar({ close, volume: 10, taker_buy_volume: 5 + (close % 3) }));
+    const withoutHidden = scanForCVDDivergence(bars, { type: 'bullish', cvdWindow: 2, lookback: 1, includeHidden: false });
+    const withHidden = scanForCVDDivergence(bars, { type: 'bullish', cvdWindow: 2, lookback: 1, includeHidden: true });
+    if (withHidden.divergence === true && withHidden.pattern === 'hidden') {
+      assert.equal(withoutHidden.divergence, false);
+      assert.match(withoutHidden.reason, /hidden/);
+    } else {
+      assert.deepEqual(withoutHidden.divergence, withHidden.divergence);
+    }
+  });
+
+  it('feeds directly into buildDivergenceTradePlan (shape compatibility)', () => {
+    const closes = [100, 103, 96, 103, 97, 103, 95, 103, 98];
+    const takerBuy = [5, 5, 5, 2.5, 2.5, 7.5, 7.5, 5, 5];
+    const bars = closes.map((close, i) => cvdBar({ close, volume: 10, taker_buy_volume: takerBuy[i] }));
+    const result = scanForCVDDivergence(bars, { type: 'bullish', cvdWindow: 2, lookback: 1 });
+    assert.equal(result.divergence, true);
+
+    const plan = buildDivergenceTradePlan({ hit: result, lastSwingLevel: 105, rangeLevel: 110 });
+    assert.equal(plan.side, 'long');
+    assert.equal(plan.pattern, 'strong');
   });
 });
 

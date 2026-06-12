@@ -152,6 +152,7 @@ export async function getKlines({ symbol, interval = '1m', limit = 100 } = {}) {
     close: Number(k[4]),
     volume: Number(k[5]),
     close_time: k[6],
+    taker_buy_volume: Number(k[9]),
   }));
   return { success: true, symbol: symbol.toUpperCase(), interval, count: klines.length, klines };
 }

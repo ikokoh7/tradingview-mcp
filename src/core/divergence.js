@@ -78,6 +78,47 @@ function rsiFromAverages(avgGain, avgLoss) {
 }
 
 /**
+ * Cumulative Volume Delta over a trailing rolling window — the oscillator
+ * side of a CVD divergence comparison (Chapter 18, "Master-Class on
+ * Cumulative Volume Delta"):
+ *
+ *   - Delta = aggressive buy volume - aggressive sell volume for a bar.
+ *     Binance klines report `taker_buy_volume` (the aggressive-buy share of
+ *     `volume`); aggressive-sell volume is the remainder, so
+ *     delta = takerBuy - (volume - takerBuy) = 2*takerBuy - volume.
+ *   - CVD "Plots this Delta in a cumulative manner" (Ch.18). A true
+ *     since-inception cumulative is unbounded and would make classifyStep's
+ *     percent-tolerance comparison meaningless over a long history (a tiny
+ *     recent wobble could never register as "higher"/"lower" against a huge
+ *     accumulated total). Instead CVD here is the sum of `delta` over a
+ *     trailing `window` of bars — bounded, comparable bar-to-bar, and still
+ *     exactly "cumulative delta" within the window the divergence is being
+ *     read over.
+ *   - Mirrors calculateRSI's warm-up convention: the first `window - 1`
+ *     entries are `null` (not enough bars yet for a full window).
+ *
+ * Bars must include `volume` and `taker_buy_volume` (both present on
+ * getKlines() output).
+ */
+export function calculateCVD(bars, { window = 14 } = {}) {
+  requireBars(bars);
+  if (!Number.isInteger(window) || window <= 0) throw new Error('window must be a positive integer');
+
+  const deltas = bars.map(b => 2 * Number(b.taker_buy_volume) - Number(b.volume));
+  const values = new Array(bars.length).fill(null);
+  for (let i = window - 1; i < bars.length; i++) {
+    let sum = 0;
+    let valid = true;
+    for (let j = i - window + 1; j <= i; j++) {
+      if (!Number.isFinite(deltas[j])) { valid = false; break; }
+      sum += deltas[j];
+    }
+    values[i] = valid ? sum : null;
+  }
+  return values;
+}
+
+/**
  * Local-extreme finder over a plain numeric series (shared by close-based
  * price swings and RSI swings — both are just "find the pivot" over a series
  * of numbers, the only difference is which series and which direction).
@@ -221,6 +262,47 @@ export function scanForDivergence(bars, { type, rsiPeriod = 14, lookback = 2, to
     };
   }
   return { ...result, rsi_values: rsiValues };
+}
+
+/**
+ * Full pipeline for CVD divergence — same close-based price swings and the
+ * same strong/medium/weak/hidden taxonomy as scanForDivergence, but the
+ * oscillator side is rolling-window CVD (calculateCVD) instead of RSI.
+ *
+ * Per Chapter 18: "Absorption" (CVD makes a new high/low, price doesn't
+ * follow) and "Exhaustion" (price makes a new high/low, CVD doesn't follow)
+ * are both described as "a divergence between price and the CVD line" —
+ * mechanically identical to the RSI divergence comparison, just with a
+ * different oscillator. Hidden divergences are excluded by default for the
+ * same reason as scanForDivergence (continuation signal, not traded).
+ */
+export function scanForCVDDivergence(bars, { type, cvdWindow = 14, lookback = 2, tolerancePercent = 0.05, includeHidden = false } = {}) {
+  requireBars(bars);
+  const dir = String(type).toLowerCase();
+  if (!['bullish', 'bearish'].includes(dir)) throw new Error('type must be "bullish" or "bearish"');
+
+  const cvdValues = calculateCVD(bars, { window: cvdWindow });
+  const priceSwings = dir === 'bullish'
+    ? findCloseSwingLows(bars, { lookback })
+    : findCloseSwingHighs(bars, { lookback });
+
+  const result = classifyDivergence({ priceSwings, rsiValues: cvdValues, direction: dir, tolerancePercent });
+  if (!result.divergence) {
+    if (result.reason) result.reason = result.reason.replace('RSI', 'CVD');
+    return result;
+  }
+  if (result.pattern === 'hidden' && !includeHidden) {
+    return {
+      ...result,
+      divergence: false,
+      reason: 'hidden divergence found but excluded by default (continuation signal, not traded per curriculum — pass includeHidden:true to include it)',
+    };
+  }
+
+  // Remap the generic "rsi_*" field names from classifyDivergence to "cvd_*"
+  // for callers — the comparison logic is identical, only the label differs.
+  const { rsi_step, older_rsi, newer_rsi, ...rest } = result;
+  return { ...rest, cvd_step: rsi_step, older_cvd: older_rsi, newer_cvd: newer_rsi, cvd_values: cvdValues };
 }
 
 /**

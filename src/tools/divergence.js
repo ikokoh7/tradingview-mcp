@@ -73,6 +73,47 @@ export function registerDivergenceTools(server) {
     }
   );
 
+  server.tool('divergence_calculate_cvd', 'Calculate rolling-window Cumulative Volume Delta (CVD) over a bar series — per-bar delta = takerBuyVolume - (volume - takerBuyVolume), summed over a trailing window (Chapter 18)', {
+    bars: z.array(barSchema.extend({
+      volume: z.coerce.number(),
+      taker_buy_volume: z.coerce.number(),
+    })).describe('OHLC candle array, oldest first, with volume and taker_buy_volume (from binance klines)'),
+    window: z.coerce.number().int().positive().optional().describe('Rolling window size in bars for the cumulative sum (default 14)'),
+  }, async ({ bars, window }) => {
+    try { return jsonResult({ success: true, cvd: core.calculateCVD(bars, { window }) }); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool(
+    'divergence_scan_cvd',
+    'Scan a bar series for CVD divergence (Chapter 18 — "Master-Class on Cumulative Volume Delta"): computes rolling-window CVD, ' +
+    'finds the relevant close-based price swings (LOWS only for bullish, HIGHS only for bearish), and classifies the two most ' +
+    'recent same-side swings into the same strong/medium/weak/hidden taxonomy as RSI divergence. ' +
+    '"Absorption" = CVD makes a new extreme but price doesn\'t follow; "Exhaustion" = price makes a new extreme but CVD doesn\'t ' +
+    'follow — both are divergences in this taxonomy. Hidden divergences are excluded by default (continuation signal).',
+    {
+      bars: z.array(barSchema.extend({
+        volume: z.coerce.number(),
+        taker_buy_volume: z.coerce.number(),
+      })).describe('OHLC candle array to scan, oldest first, with volume and taker_buy_volume'),
+      type: z.enum(['bullish', 'bearish']).describe('"bullish" = look for a bottom via the LOWS; "bearish" = look for a top via the HIGHS'),
+      cvd_window: z.coerce.number().int().positive().optional().describe('Rolling window size in bars for CVD (default 14)'),
+      lookback: z.coerce.number().int().positive().optional().describe('Bars on each side required to confirm a swing point (default 2)'),
+      tolerance_percent: z.coerce.number().nonnegative().optional().describe('Percent tolerance for treating two extremes as "equal" / a double top-or-bottom (default 0.05)'),
+      include_hidden: z.coerce.boolean().optional().describe('Include hidden divergences in results (default false)'),
+    },
+    async ({ bars, type, cvd_window, lookback, tolerance_percent, include_hidden }) => {
+      try {
+        return jsonResult({
+          success: true,
+          ...core.scanForCVDDivergence(bars, {
+            type, cvdWindow: cvd_window, lookback, tolerancePercent: tolerance_percent, includeHidden: include_hidden,
+          }),
+        });
+      } catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+    }
+  );
+
   server.tool(
     'divergence_build_trade_plan',
     'Build a trade plan (entry/stop/target/side) from a confirmed divergence (from divergence_scan), in the exact ' +

@@ -77,6 +77,7 @@ export async function getKlines({ symbol, interval = '1m', limit = 100 } = {}) {
     close: Number(k[4]),
     volume: Number(k[5]),
     close_time: k[6],
+    taker_buy_volume: Number(k[9]),
   }));
   return { success: true, symbol: symbol.toUpperCase(), interval, count: klines.length, klines };
 }
@@ -129,12 +130,42 @@ export async function setMarginType({ symbol, marginType = 'ISOLATED' } = {}) {
 
 const ORDER_TYPES = ['MARKET', 'LIMIT', 'STOP_MARKET', 'TAKE_PROFIT_MARKET'];
 
+// As of 2025-12-09, Binance migrated conditional order types (STOP_MARKET,
+// TAKE_PROFIT_MARKET, etc.) to the Algo Order service — /fapi/v1/order rejects
+// them with -4120 STOP_ORDER_SWITCH_ALGO. These must go to /fapi/v1/algoOrder
+// instead, with stopPrice renamed to triggerPrice and algoType: 'CONDITIONAL'.
+const CONDITIONAL_ORDER_TYPES = ['STOP_MARKET', 'TAKE_PROFIT_MARKET'];
+
 export async function placeOrder({ symbol, side, type = 'MARKET', quantity, price, stopPrice, closePosition = false } = {}) {
   if (!symbol) throw new Error('symbol is required');
   const sideUpper = String(side || '').toUpperCase();
   if (!['BUY', 'SELL'].includes(sideUpper)) throw new Error('side must be BUY or SELL');
   const typeUpper = String(type || '').toUpperCase();
   if (!ORDER_TYPES.includes(typeUpper)) throw new Error(`type must be one of: ${ORDER_TYPES.join(', ')}`);
+
+  if (CONDITIONAL_ORDER_TYPES.includes(typeUpper)) {
+    const params = { algoType: 'CONDITIONAL', symbol: symbol.toUpperCase(), side: sideUpper, type: typeUpper };
+    if (closePosition) {
+      params.closePosition = 'true';
+    } else {
+      params.quantity = requirePositiveFinite(quantity, 'quantity');
+    }
+    params.triggerPrice = requirePositiveFinite(stopPrice, 'stopPrice');
+
+    const result = await signedRequest('POST', '/fapi/v1/algoOrder', params);
+    return {
+      success: true,
+      order_id: result.algoId,
+      symbol: result.symbol,
+      side: result.side,
+      type: result.orderType,
+      status: result.algoStatus,
+      quantity: closePosition ? null : Number(result.origQty),
+      price: undefined,
+      stop_price: result.triggerPrice ? Number(result.triggerPrice) : undefined,
+      close_position: result.closePosition === 'true',
+    };
+  }
 
   const params = { symbol: symbol.toUpperCase(), side: sideUpper, type: typeUpper };
 
@@ -147,10 +178,6 @@ export async function placeOrder({ symbol, side, type = 'MARKET', quantity, pric
   if (typeUpper === 'LIMIT') {
     params.price = requirePositiveFinite(price, 'price');
     params.timeInForce = 'GTC';
-  }
-
-  if (['STOP_MARKET', 'TAKE_PROFIT_MARKET'].includes(typeUpper)) {
-    params.stopPrice = requirePositiveFinite(stopPrice, 'stopPrice');
   }
 
   const result = await signedRequest('POST', '/fapi/v1/order', params);

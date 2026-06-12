@@ -38,7 +38,7 @@ if (existsSync(envPath)) {
 const { getKlines, accountInfo, placeOrder, getPositions, setLeverage, setMarginType } =
   await import('../src/core/binance_futures.js');
 const { findSwingHighs, findSwingLows, scanForSFP, buildSFPTradePlan } = await import('../src/core/sfp.js');
-const { scanForDivergence, buildDivergenceTradePlan } = await import('../src/core/divergence.js');
+const { scanForDivergence, scanForCVDDivergence, buildDivergenceTradePlan } = await import('../src/core/divergence.js');
 const { detectZones, findZoneRetests, buildZoneTradePlan } = await import('../src/core/levels.js');
 const { scanForFibReaction, buildFibTradePlan } = await import('../src/core/fibonacci.js');
 const { detectMarketStructure, buildStructureTradePlan } = await import('../src/core/market_structure.js');
@@ -58,6 +58,7 @@ const FRESHNESS_BARS    = 2;
 const HTF_FRESHNESS_BARS = 3;
 const LADDER_ORDERS     = 3;
 const RSI_PERIOD        = 14;
+const CVD_WINDOW        = 14;    // rolling-window size for CVD divergence (Ch.18) — same default as RSI_PERIOD
 // Curriculum kill zones — institutional liquidity windows where clean moves form.
 // Outside these windows the bot stands down to avoid low-liquidity chop.
 const KILL_ZONES = [
@@ -156,6 +157,34 @@ function findFreshDivergenceSignal(klines4h, ctx4h) {
     confirmedAt: hit.newer_swing.bar.open_time,
     signalKey: `divergence:${hit.pattern}:${type}:${hit.newer_swing.bar.open_time}`,
     summary: `4H ${hit.pattern} ${type} divergence (entry ${plan.entry}, stop ${plan.stop})`,
+  };
+}
+
+// Runs on 15m bars, unlike RSI divergence's 4H — Ch.18: "I limit myself to
+// trading with CVD only on the short term" / "We limit CVD usage to short
+// term trading". Otherwise identical pipeline to findFreshDivergenceSignal,
+// just with scanForCVDDivergence + the 15m execution context.
+function findFreshCVDDivergenceSignal(klines, ctx) {
+  const { lastSwingHigh, lastSwingLow, rangeHigh, rangeLow, lastIndex } = ctx;
+  const candidates = [];
+  for (const type of ['bullish', 'bearish']) {
+    const result = scanForCVDDivergence(klines, { type, cvdWindow: CVD_WINDOW });
+    if (result.divergence) candidates.push({ hit: result, type });
+  }
+  const fresh = candidates.filter(c => lastIndex - c.hit.newer_swing.index <= FRESHNESS_BARS);
+  if (!fresh.length) return null;
+
+  fresh.sort((a, b) => b.hit.newer_swing.index - a.hit.newer_swing.index);
+  const { hit, type } = fresh[0];
+  const target = type === 'bullish' ? lastSwingHigh.price : lastSwingLow.price;
+  const alt    = type === 'bullish' ? rangeHigh : rangeLow;
+  const plan = buildDivergenceTradePlan({ hit, lastSwingLevel: target, rangeLevel: alt });
+  return {
+    strategy: 'cvd_divergence',
+    plan,
+    confirmedAt: hit.newer_swing.bar.open_time,
+    signalKey: `cvd_divergence:${hit.pattern}:${type}:${hit.newer_swing.bar.open_time}`,
+    summary: `15m ${hit.pattern} ${type} CVD divergence (entry ${plan.entry}, stop ${plan.stop})`,
   };
 }
 
@@ -335,10 +364,11 @@ for (const symbol of SYMBOLS) {
     const fibSignal        = findFreshFibSignal(klines, ctx);
     const structureSignal  = findFreshStructureSignal(klines, ctx, swingHighs, swingLows);
     const pinbarSignal     = findFreshPinbarSignal(klines, ctx, swingHighs, swingLows);
+    const cvdDivergenceSignal = findFreshCVDDivergenceSignal(klines, ctx);
     const divergenceSignal = ctx4h ? findFreshDivergenceSignal(klines4h, ctx4h) : null;
     const htfBias          = ctx4h ? findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) : null;
 
-    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, pinbarSignal, divergenceSignal].filter(Boolean);
+    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, pinbarSignal, divergenceSignal, cvdDivergenceSignal].filter(Boolean);
 
     // 4H pinbar bias — filter opposing signals, with divergence+levels exemption.
     // Same logic as the spot bot's daily bias exemption: a divergence+levels pair
