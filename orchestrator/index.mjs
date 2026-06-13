@@ -22,6 +22,22 @@ import { MODEL, THRESHOLDS, UNIVERSE } from './config.mjs';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
 
+// Load the repo-root .env (gitignored) so ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
+// can live alongside the bots' Binance keys — no secret on the command line.
+// Same minimal KEY=VALUE loader the bots use; existing env vars win.
+for (const envPath of [join(ROOT, '.env'), join(__dirname, '.env')]) {
+  if (!existsSync(envPath)) continue;
+  for (const line of readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const eq = t.indexOf('=');
+    if (eq === -1) continue;
+    const k = t.slice(0, eq).trim();
+    const v = t.slice(eq + 1).trim();
+    if (!(k in process.env)) process.env[k] = v;
+  }
+}
+
 const paths = {
   config: join(ROOT, 'orchestrator_config.json'),
   ledger: join(ROOT, 'trade_ledger.jsonl'),

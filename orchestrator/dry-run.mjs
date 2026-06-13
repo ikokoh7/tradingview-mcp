@@ -45,17 +45,32 @@ for (const bot of ['spot', 'futures']) {
   console.log(`\n=== ${bot.toUpperCase()} ===`);
 
   const baseEst = estimatePerformance(current, trades);
-  console.log(`current config baseline: win%=${pct(baseEst.winRate)} expectancy=${r(baseEst.expectancy)} sample=${baseEst.sample} (source: ${baseEst.source})`);
-
+  console.log(`baseline (current config): win%=${pct(baseEst.winRate)} expectancy=${r(baseEst.expectancy)} sample=${baseEst.sample} (source: ${baseEst.source})`);
   const reaffirm = validateProposal({ bot, current, candidate: current, estimate: baseEst });
-  console.log(`re-affirm current → ${reaffirm.classification} (changes: ${reaffirm.changes.length})`);
+  console.log(`re-affirm current → ${reaffirm.classification}`);
 
-  // Example single-change candidate: disable cvd_divergence.
-  const candidate = { ...current, active_strategies: (current.active_strategies ?? []).filter((s) => s !== 'cvd_divergence') };
-  const est = estimatePerformance(candidate, trades);
-  const verdict = validateProposal({ bot, current, candidate, estimate: est });
-  console.log(`candidate "disable cvd_divergence": win%=${pct(est.winRate)} expectancy=${r(est.expectancy)} sample=${est.sample} (source: ${est.source}) → ${verdict.classification}`);
-  if (verdict.violations.length) console.log(`  violations: ${verdict.violations.join(' | ')}`);
+  // Sweep every single strategy toggle (one change each), estimate via trade-log
+  // replay, run through the guardrails, and rank: auto-eligible first.
+  const rank = { auto: 0, approval: 1, reject: 2 };
+  const rows = [];
+  for (const s of UNIVERSE[bot].strategies) {
+    const set = new Set(current.active_strategies ?? []);
+    const dir = set.has(s) ? 'disable' : 'enable';
+    if (set.has(s)) set.delete(s); else set.add(s);
+    const candidate = { ...current, active_strategies: [...set] };
+    const est = estimatePerformance(candidate, trades);
+    const v = validateProposal({ bot, current, candidate, estimate: est });
+    rows.push({ label: `${dir} ${s}`, est, v });
+  }
+  rows.sort((a, b) => (rank[a.v.classification] - rank[b.v.classification]) || ((b.est.winRate ?? 0) - (a.est.winRate ?? 0)));
+
+  console.log('strategy toggles (one change each):');
+  for (const { label, est, v } of rows) {
+    const why = v.violations.length ? `  [${v.violations.join('; ')}]` : '';
+    console.log(`  ${label.padEnd(26)} win%=${pct(est.winRate)} exp=${r(est.expectancy)} n=${est.sample} → ${v.classification.toUpperCase()}${why}`);
+  }
+  console.log(`filter toggles (${UNIVERSE[bot].filters.join(', ')}): effect NOT measurable offline —`);
+  console.log('  the backtest baked in whichever filters were on; regenerate a backtest with the filter toggled to measure its impact.');
 }
 
 console.log(`\n(no live config written — deterministic dry-run; universe: ` +
