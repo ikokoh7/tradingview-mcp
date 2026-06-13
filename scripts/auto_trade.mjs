@@ -103,6 +103,7 @@ const CVD_WINDOW       = 14;     // rolling-window size for CVD divergence (Ch.1
 const STATE_PATH = join(ROOT, 'auto_trade_state.json');
 const LOG_PATH = join(ROOT, 'auto_trade.log');
 const EVENTS_PATH = join(ROOT, 'bot_events.jsonl');   // escalation feed read by the orchestrator agent
+const LEDGER_PATH = join(ROOT, 'trade_ledger.jsonl');  // resolved-trade ledger read by the orchestrator agent and the trade journal
 
 function loadState() {
   if (!existsSync(STATE_PATH)) return {};
@@ -124,6 +125,16 @@ function emitEvent(severity, type, fields = {}) {
     const rec = { ts: new Date().toISOString(), bot: 'spot', severity, type, ...fields };
     appendFileSync(EVENTS_PATH, JSON.stringify(rec) + '\n');
   } catch { /* escalation is best-effort */ }
+}
+
+// Append one trade-lifecycle record (phase 'open') for the trade journal. Never throws.
+// Spot has no exchange-side SL/TP, so there is no automated 'close' phase — the
+// journal generator leaves exit/win-loss columns blank for spot 'open' records
+// until they're filled in manually or a close-resolution pass is added.
+function appendLedger(record) {
+  try {
+    appendFileSync(LEDGER_PATH, JSON.stringify({ ts: new Date().toISOString(), bot: 'spot', ...record }) + '\n');
+  } catch { /* ledger write is best-effort */ }
 }
 
 // ---- Orchestrator control plane ------------------------------------------
@@ -589,11 +600,22 @@ for (const symbol of SYMBOLS) {
     }
 
     const plan = confluence.plan;
-    const gate = evaluateTradeSetup({
-      capital: usdt, riskPercent: RISK_PERCENT, leverage: 1,
-      entry: plan.entry, stop: plan.stop, target: plan.target, side: plan.side,
-      historicalWinRate: HISTORICAL_WIN_RATE, availableCapital: usdt,
-    });
+    let gate;
+    try {
+      gate = evaluateTradeSetup({
+        capital: usdt, riskPercent: RISK_PERCENT, leverage: 1,
+        entry: plan.entry, stop: plan.stop, target: plan.target, side: plan.side,
+        historicalWinRate: HISTORICAL_WIN_RATE, availableCapital: usdt,
+      });
+    } catch (err) {
+      // The agreeing strategy's plan can go stale between signal detection and
+      // here (e.g. a swing-level target price has already passed) — riskRewardRatio()
+      // correctly rejects entry/stop/target combos that don't make sense for `side`.
+      // That's a "stand down this cycle", not a scan failure.
+      log(`${symbol}: confluence setup found (entry ${plan.entry}, stop ${plan.stop}, target ${plan.target}) but is invalid — ${err.message} — standing down`);
+      state[symbol] = { last_signal_key: combinedKey, outcome: 'gate_failed' };
+      continue;
+    }
 
     if (!gate.passes) {
       log(`${symbol}: confluence setup found (entry ${plan.entry}, stop ${plan.stop}) but FAILS the risk gate — ${gate.reasons.join('; ')}`);
@@ -674,11 +696,17 @@ for (const symbol of SYMBOLS) {
       state[symbol] = { ...state[symbol], outcome: 'executed', orders: [order] };
     }
 
-    // Spot has no exchange-side exit, so this is an activity event only — not a
-    // resolvable ledger trade. Spot win%/expectancy comes from run_backtest.mjs.
+    // Spot has no exchange-side exit, so win%/expectancy still comes from
+    // run_backtest.mjs — but record the 'open' phase for the trade journal
+    // (exit/win-loss columns are left blank for spot until resolved manually).
+    const combo = confluence.agreeing_strategies.slice().sort().join('+');
+    appendLedger({
+      phase: 'open', id: combinedKey, symbol, combo, side: exec.order_side,
+      entry: plan.entry, stop: plan.stop, target: plan.target, planned_rr: Number(gate.reward_per_risk.toFixed(2)), qty: quantity,
+    });
     emitEvent('info', 'trade_executed', {
       symbol,
-      combo: confluence.agreeing_strategies.slice().sort().join('+'),
+      combo,
       side: exec.order_side,
       entry: plan.entry,
       stop: plan.stop,

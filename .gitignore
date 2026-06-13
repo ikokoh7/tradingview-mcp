@@ -15,6 +15,7 @@ backtest_results.json
 backtest_futures_results.json
 strategy_winners_results.csv
 strategy_winners_summary.md
+trading_journal.xlsx
 stream_logs/
 *.err
 # orchestrator runtime data (append-only logs + per-cycle cursor; created at runtime)

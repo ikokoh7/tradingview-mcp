@@ -491,6 +491,7 @@ for (const symbol of SYMBOLS) {
         phase: 'close', id: st.last_signal_key ?? null, symbol,
         combo: st.combo ?? null, side: st.position_side ?? null,
         entry: st.entry_price ?? null, stop: st.sl_price ?? null, target: st.tp_price ?? null,
+        qty: st.qty ?? null, planned_rr: st.planned_rr ?? null,
         exit_reason: exitReason, win, realized_r: realizedR,
         opened_at: st.executed_at ?? null, closed_at: new Date().toISOString(),
       });
@@ -634,11 +635,22 @@ for (const symbol of SYMBOLS) {
 
     // availableCapital = usdt * LEVERAGE: the notional position size is capped at
     // what 2x leverage on our available margin can control
-    const gate = evaluateTradeSetup({
-      capital: usdt, riskPercent: RISK_PERCENT, leverage: LEVERAGE,
-      entry: plan.entry, stop: plan.stop, target: plan.target, side: plan.side,
-      historicalWinRate: HISTORICAL_WIN_RATE, availableCapital: usdt * LEVERAGE,
-    });
+    let gate;
+    try {
+      gate = evaluateTradeSetup({
+        capital: usdt, riskPercent: RISK_PERCENT, leverage: LEVERAGE,
+        entry: plan.entry, stop: plan.stop, target: plan.target, side: plan.side,
+        historicalWinRate: HISTORICAL_WIN_RATE, availableCapital: usdt * LEVERAGE,
+      });
+    } catch (err) {
+      // The agreeing strategy's plan can go stale between signal detection and
+      // here (e.g. a swing-level target price has already passed) — riskRewardRatio()
+      // correctly rejects entry/stop/target combos that don't make sense for `side`.
+      // That's a "stand down this cycle", not a scan failure.
+      log(`${symbol}: confluence setup found (entry ${plan.entry}, stop ${plan.stop}, target ${plan.target}) but is invalid — ${err.message} — standing down`);
+      state[symbol] = { last_signal_key: combinedKey, outcome: 'gate_failed' };
+      continue;
+    }
 
     if (!gate.passes) {
       log(`${symbol}: confluence setup found (entry ${plan.entry}, stop ${plan.stop}) but FAILS the risk gate — ${gate.reasons.join('; ')}`);
@@ -694,6 +706,7 @@ for (const symbol of SYMBOLS) {
       tp_price: tpPrice,
       combo,                       // recorded so the close phase can book the ledger
       planned_rr: plannedRr,       // win R = planned R:R; loss = -1R (fixed-R model)
+      qty: quantity,                // recorded for the trade journal's position-size column
       executed_at: new Date().toISOString(),
     };
     saveState(state);
@@ -702,7 +715,7 @@ for (const symbol of SYMBOLS) {
     // detected gone (top of the loop), pairing on `id` = last_signal_key.
     appendLedger({
       phase: 'open', id: combinedKey, symbol, combo, side: plan.side,
-      entry: plan.entry, stop: slPrice, target: tpPrice, planned_rr: plannedRr,
+      entry: plan.entry, stop: slPrice, target: tpPrice, planned_rr: plannedRr, qty: quantity,
     });
     emitEvent('info', 'trade_open', { symbol, combo, side: plan.side, entry: plan.entry, planned_rr: plannedRr });
 
