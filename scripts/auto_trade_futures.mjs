@@ -60,7 +60,7 @@ const INTERVAL_HTF      = '4h';
 const LEVERAGE          = 2;       // curriculum cap is 5x; 2x is the conservative starting point
 const MARGIN_TYPE       = 'ISOLATED';
 const RISK_PERCENT      = 1;
-const HISTORICAL_WIN_RATE = 61;  // measured: 43W/71 resolved trades, futures backtest now incl. chart_pattern (8th strategy) (2026-06-13). Lowered from 66 (pre-chart_pattern) — stricter, accurate breakeven R:R
+const HISTORICAL_WIN_RATE = 60;  // measured: 41W/68 resolved trades (2026-06-13), after fixing pinbar signalKey dedup bug (biasIndex -> biasBar.open_time) which had inflated the prior 74-trade sample to 71. chart_pattern+pinbar now correctly 20% (1/5)
 const FRESHNESS_BARS    = 2;
 const HTF_FRESHNESS_BARS = 3;
 const LADDER_ORDERS     = 3;
@@ -347,7 +347,7 @@ function findFreshPinbarSignal(klines, ctx, swingHighs, swingLows) {
     strategy: 'pinbar',
     plan,
     confirmedAt: hit.bar.open_time,
-    signalKey: `pinbar:${hit.direction}:${hit.biasIndex}:${hit.bar.open_time}`,
+    signalKey: `pinbar:${hit.direction}:${hit.biasBar.open_time}:${hit.bar.open_time}`,
     summary: `${hit.direction} pinbar at swing extreme + level retest (entry ${plan.entry}, stop ${plan.stop})`,
   };
 }

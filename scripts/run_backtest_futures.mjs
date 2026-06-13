@@ -264,7 +264,7 @@ function findFreshPinbarSignal(klines, ctx, swingHighs, swingLows) {
   const alt    = hit.direction === 'bullish' ? rangeHigh : rangeLow;
   const plan = buildPinbarTradePlan({ hit, lastSwingLevel: target, rangeLevel: alt });
   return { strategy: 'pinbar', plan, confirmedAt: hit.bar.open_time,
-    signalKey: `pinbar:${hit.direction}:${hit.biasIndex}:${hit.bar.open_time}`,
+    signalKey: `pinbar:${hit.direction}:${hit.biasBar.open_time}:${hit.bar.open_time}`,
     summary: `${hit.direction} pinbar at swing extreme` };
 }
 

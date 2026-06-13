@@ -403,7 +403,7 @@ function findFreshPinbarSignal(klines, ctx, swingHighs, swingLows) {
     strategy: 'pinbar',
     plan,
     confirmedAt: hit.bar.open_time,
-    signalKey: `pinbar:${hit.direction}:${hit.biasIndex}:${hit.bar.open_time}`,
+    signalKey: `pinbar:${hit.direction}:${hit.biasBar.open_time}:${hit.bar.open_time}`,
     summary: `${hit.direction} pinbar at swing extreme + level retest (entry ${plan.entry}, stop ${plan.stop})`,
   };
 }
