@@ -79,8 +79,16 @@ const { buildLadderOrders } = await import('../src/core/laddering.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
 const { classifyVWAPBias, classifyValueAreaBias } = await import('../src/core/volume_profile.js');
 const { evaluateTradeSetup, translateForAccount } = await import('../src/core/risk.js');
+const { fetchTopVolumeSymbols } = await import('../src/core/top_volume.js');
 
-const SYMBOLS          = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+const CORE_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+let topVolumeSymbols = [];
+try {
+  topVolumeSymbols = await fetchTopVolumeSymbols(20);
+} catch (e) {
+  console.error(`fetchTopVolumeSymbols failed, falling back to core symbols only: ${e.message}`);
+}
+const SYMBOLS = [...new Set([...CORE_SYMBOLS, ...topVolumeSymbols])];
 const INTERVAL         = '15m';
 const INTERVAL_HTF     = '4h';   // Ch.10/11: divergence "minimum 4-hour timeframe"; Ch.3: pinbar is HTF bias
 const INTERVAL_DAILY   = '1d';   // macro structural bias — daily BOS/CHoCH establishes the trend filters below
