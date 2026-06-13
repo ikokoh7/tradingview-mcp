@@ -31,6 +31,12 @@ const { detectZones, findZoneRetests, buildZoneTradePlan } = await import('../sr
 const { scanForFibReaction, buildFibTradePlan } = await import('../src/core/fibonacci.js');
 const { detectMarketStructure, buildStructureTradePlan } = await import('../src/core/market_structure.js');
 const { scanForPinbarSetup, buildPinbarTradePlan } = await import('../src/core/pinbar.js');
+const {
+  findDoubleTopBottom, scanForNecklineBreak, buildDoubleTopBottomTradePlan,
+  findHeadAndShoulders, buildHeadAndShouldersTradePlan,
+  findTriangle, scanForTriangleBreakout, buildTriangleTradePlan,
+  findFlagPennant, scanForFlagBreakout, buildFlagTradePlan,
+} = await import('../src/core/chart_patterns.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
 const { classifyVWAPBias, classifyValueAreaBias } = await import('../src/core/volume_profile.js');
 
@@ -262,6 +268,64 @@ function findFreshPinbarSignal(klines, ctx, swingHighs, swingLows) {
     summary: `${hit.direction} pinbar at swing extreme` };
 }
 
+function buildChartPatternPlan({ pattern, breakout, rangeLevel }) {
+  switch (pattern.type) {
+    case 'double_top':
+    case 'double_bottom':
+      return buildDoubleTopBottomTradePlan({ pattern, breakout, rangeLevel });
+    case 'head_and_shoulders':
+    case 'inverse_head_and_shoulders':
+      return buildHeadAndShouldersTradePlan({ pattern, breakout, rangeLevel });
+    case 'ascending_triangle':
+    case 'descending_triangle':
+    case 'symmetrical_triangle':
+      return buildTriangleTradePlan({ triangle: pattern, breakout, rangeLevel });
+    case 'flag_pennant':
+      return buildFlagTradePlan({ pattern, breakout, rangeLevel });
+    default:
+      throw new Error(`unknown chart pattern type: ${pattern.type}`);
+  }
+}
+
+function findFreshChartPatternSignal(klines, ctx, swingHighs, swingLows) {
+  const { rangeHigh, rangeLow, lastIndex } = ctx;
+  const candidates = [];
+
+  for (const pattern of findDoubleTopBottom(klines, { swingHighs, swingLows })) {
+    const breakout = scanForNecklineBreak(klines, pattern);
+    if (breakout) candidates.push({ pattern, breakout });
+  }
+  for (const pattern of findHeadAndShoulders(klines, { swingHighs, swingLows })) {
+    const breakout = scanForNecklineBreak(klines, pattern);
+    if (breakout) candidates.push({ pattern, breakout });
+  }
+  const triangle = findTriangle(klines, { swingHighs, swingLows });
+  if (triangle) {
+    const breakout = scanForTriangleBreakout(klines, triangle);
+    if (breakout) candidates.push({ pattern: triangle, breakout });
+  }
+  const flag = findFlagPennant(klines);
+  if (flag) {
+    const breakout = scanForFlagBreakout(klines, flag);
+    if (breakout) candidates.push({ pattern: flag, breakout });
+  }
+
+  const fresh = candidates.filter(c => lastIndex - c.breakout.index <= FRESHNESS_BARS);
+  if (!fresh.length) return null;
+
+  fresh.sort((a, b) => b.breakout.index - a.breakout.index);
+  const { pattern, breakout } = fresh[0];
+  const alt = pattern.side === 'long' ? rangeHigh : rangeLow;
+  const plan = buildChartPatternPlan({ pattern, breakout, rangeLevel: alt });
+  return {
+    strategy: 'chart_pattern',
+    plan,
+    confirmedAt: breakout.bar.open_time,
+    signalKey: `chart_pattern:${pattern.type}:${breakout.bar.open_time}`,
+    summary: `${pattern.type.replace(/_/g, ' ')} breakout`,
+  };
+}
+
 // ---- Outcome simulation ------------------------------------------------------
 
 function simulateOutcome(allBars, { entry, stop, target, side, startIndex }) {
@@ -333,11 +397,12 @@ async function backtestSymbol(symbol) {
       const structureSig = findFreshStructureSignal(klines, ctx, swingHighs, swingLows);
       const pinbarSig    = findFreshPinbarSignal(klines, ctx, swingHighs, swingLows);
       const cvdDivSig    = findFreshCVDDivergenceSignal(klines, ctx);
+      const chartPatternSig = findFreshChartPatternSignal(klines, ctx, swingHighs, swingLows);
       const divSig       = ctx4h ? findFreshDivergenceSignal(klines4h, ctx4h) : null;
       const htfBias      = ctx4h ? findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) : null;
 
       // 4H pinbar bias with divergence+levels exemption (mirrors futures bot)
-      let candidates = [sfpSig, levelsSig, fibSig, structureSig, pinbarSig, divSig, cvdDivSig].filter(Boolean);
+      let candidates = [sfpSig, levelsSig, fibSig, structureSig, pinbarSig, divSig, cvdDivSig, chartPatternSig].filter(Boolean);
       if (htfBias) {
         const biasSide  = htfBias.direction === 'bullish' ? 'long' : 'short';
         const otherSide = biasSide === 'long' ? 'short' : 'long';

@@ -18,3 +18,4 @@ export * as binance from './binance.js';
 export * as binanceLive from './binance_live.js';
 export * as risk from './risk.js';
 export * as sfp from './sfp.js';
+export * as chartPatterns from './chart_patterns.js';

@@ -43,6 +43,12 @@ const { detectZones, findZoneRetests, buildZoneTradePlan } = await import('../sr
 const { scanForFibReaction, buildFibTradePlan } = await import('../src/core/fibonacci.js');
 const { detectMarketStructure, buildStructureTradePlan } = await import('../src/core/market_structure.js');
 const { scanForPinbarSetup, buildPinbarTradePlan } = await import('../src/core/pinbar.js');
+const {
+  findDoubleTopBottom, scanForNecklineBreak, buildDoubleTopBottomTradePlan,
+  findHeadAndShoulders, buildHeadAndShouldersTradePlan,
+  findTriangle, scanForTriangleBreakout, buildTriangleTradePlan,
+  findFlagPennant, scanForFlagBreakout, buildFlagTradePlan,
+} = await import('../src/core/chart_patterns.js');
 const { buildLadderOrders } = await import('../src/core/laddering.js');
 const { assessConfluence } = await import('../src/core/confluence.js');
 const { classifyVWAPBias, classifyValueAreaBias } = await import('../src/core/volume_profile.js');
@@ -54,7 +60,7 @@ const INTERVAL_HTF      = '4h';
 const LEVERAGE          = 2;       // curriculum cap is 5x; 2x is the conservative starting point
 const MARGIN_TYPE       = 'ISOLATED';
 const RISK_PERCENT      = 1;
-const HISTORICAL_WIN_RATE = 66;  // measured: 33W/50 resolved trades, futures backtest now incl. CVD divergence + VWAP/VPVR filters (2026-06-12). Lowered from 69 (pre-CVD) — stricter, accurate breakeven R:R
+const HISTORICAL_WIN_RATE = 61;  // measured: 43W/71 resolved trades, futures backtest now incl. chart_pattern (8th strategy) (2026-06-13). Lowered from 66 (pre-chart_pattern) — stricter, accurate breakeven R:R
 const FRESHNESS_BARS    = 2;
 const HTF_FRESHNESS_BARS = 3;
 const LADDER_ORDERS     = 3;
@@ -109,7 +115,7 @@ function appendLedger(record) {
 // daily_structure filter (it shorts freely). A missing or malformed file fails
 // OPEN to all-active (current behavior), never into a degraded state.
 const ORCH_CONFIG_PATH     = join(ROOT, 'orchestrator_config.json');
-const VALIDATED_STRATEGIES = new Set(['sfp', 'divergence', 'cvd_divergence', 'levels', 'fibonacci', 'market_structure', 'pinbar']);
+const VALIDATED_STRATEGIES = new Set(['sfp', 'divergence', 'cvd_divergence', 'levels', 'fibonacci', 'market_structure', 'pinbar', 'chart_pattern']);
 const VALIDATED_FILTERS    = new Set(['pinbar_bias_4h', 'vwap_bias', 'value_area_bias']);
 
 function loadOrchestratorConfig() {
@@ -346,6 +352,68 @@ function findFreshPinbarSignal(klines, ctx, swingHighs, swingLows) {
   };
 }
 
+// Classic chart patterns (Double Top/Bottom, H&S/Inverse H&S, Triangles,
+// Flag/Pennant) — see src/core/chart_patterns.js. Not from the PDF curriculum;
+// the 8th execution strategy, encoded with the same close-based-confirmation
+// + measured-move-target conventions as the other seven.
+function buildChartPatternPlan({ pattern, breakout, rangeLevel }) {
+  switch (pattern.type) {
+    case 'double_top':
+    case 'double_bottom':
+      return buildDoubleTopBottomTradePlan({ pattern, breakout, rangeLevel });
+    case 'head_and_shoulders':
+    case 'inverse_head_and_shoulders':
+      return buildHeadAndShouldersTradePlan({ pattern, breakout, rangeLevel });
+    case 'ascending_triangle':
+    case 'descending_triangle':
+    case 'symmetrical_triangle':
+      return buildTriangleTradePlan({ triangle: pattern, breakout, rangeLevel });
+    case 'flag_pennant':
+      return buildFlagTradePlan({ pattern, breakout, rangeLevel });
+    default:
+      throw new Error(`unknown chart pattern type: ${pattern.type}`);
+  }
+}
+
+function findFreshChartPatternSignal(klines, ctx, swingHighs, swingLows) {
+  const { rangeHigh, rangeLow, lastIndex } = ctx;
+  const candidates = [];
+
+  for (const pattern of findDoubleTopBottom(klines, { swingHighs, swingLows })) {
+    const breakout = scanForNecklineBreak(klines, pattern);
+    if (breakout) candidates.push({ pattern, breakout });
+  }
+  for (const pattern of findHeadAndShoulders(klines, { swingHighs, swingLows })) {
+    const breakout = scanForNecklineBreak(klines, pattern);
+    if (breakout) candidates.push({ pattern, breakout });
+  }
+  const triangle = findTriangle(klines, { swingHighs, swingLows });
+  if (triangle) {
+    const breakout = scanForTriangleBreakout(klines, triangle);
+    if (breakout) candidates.push({ pattern: triangle, breakout });
+  }
+  const flag = findFlagPennant(klines);
+  if (flag) {
+    const breakout = scanForFlagBreakout(klines, flag);
+    if (breakout) candidates.push({ pattern: flag, breakout });
+  }
+
+  const fresh = candidates.filter(c => lastIndex - c.breakout.index <= FRESHNESS_BARS);
+  if (!fresh.length) return null;
+
+  fresh.sort((a, b) => b.breakout.index - a.breakout.index);
+  const { pattern, breakout } = fresh[0];
+  const alt = pattern.side === 'long' ? rangeHigh : rangeLow;
+  const plan = buildChartPatternPlan({ pattern, breakout, rangeLevel: alt });
+  return {
+    strategy: 'chart_pattern',
+    plan,
+    confirmedAt: breakout.bar.open_time,
+    signalKey: `chart_pattern:${pattern.type}:${breakout.bar.open_time}`,
+    summary: `${pattern.type.replace(/_/g, ' ')} breakout (entry ${plan.entry}, stop ${plan.stop})`,
+  };
+}
+
 
 // ---- Main scan --------------------------------------------------------------
 
@@ -463,8 +531,9 @@ for (const symbol of SYMBOLS) {
     const cvdDivergenceSignal = findFreshCVDDivergenceSignal(klines, ctx);
     const divergenceSignal = ctx4h ? findFreshDivergenceSignal(klines4h, ctx4h) : null;
     const htfBias          = ctx4h ? findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) : null;
+    const chartPatternSignal = findFreshChartPatternSignal(klines, ctx, swingHighs, swingLows);
 
-    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, pinbarSignal, divergenceSignal, cvdDivergenceSignal]
+    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, pinbarSignal, divergenceSignal, cvdDivergenceSignal, chartPatternSignal]
       .filter(Boolean)
       .filter(s => orch.active_strategies.has(s.strategy));   // orchestrator: run only active strategies
 
