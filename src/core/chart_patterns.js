@@ -133,18 +133,19 @@ export function scanForNecklineBreak(bars, pattern) {
  * Build a trade plan from a confirmed neckline break.
  * entry = close of the break candle; stop = beyond the pattern's extreme
  * (the higher top / lower bottom — `pattern.stopLevel`); target = measured
- * move (pattern height projected from entry, the standard TA target rule).
+ * move (pattern height projected from the NECKLINE — the standard TA target
+ * rule — not from entry, which may already sit past the neckline by the time
+ * the breakout closes).
  */
 export function buildDoubleTopBottomTradePlan({ pattern, breakout, rangeLevel } = {}) {
   if (!pattern?.necklineLevel) throw new Error('pattern must be a double_top/double_bottom result from findDoubleTopBottom');
   if (!breakout?.bar) throw new Error('breakout must be a confirmed neckline break (from scanForNecklineBreak)');
 
-  const entry = breakout.bar.close;
   const plan = {
     side: pattern.side,
-    entry,
+    entry: breakout.bar.close,
     stop: pattern.stopLevel,
-    target: measuredMoveTarget({ entry, height: pattern.height, side: pattern.side }),
+    target: measuredMoveTarget({ entry: pattern.necklineLevel, height: pattern.height, side: pattern.side }),
   };
   return withAlternateTarget(plan, rangeLevel);
 }
@@ -229,18 +230,18 @@ export function findHeadAndShoulders(bars, { swingHighs, swingLows, shoulderTole
  * Build a trade plan from a confirmed H&S/inverse-H&S neckline break.
  * entry = close of the break candle; stop = beyond the head (`pattern.stopLevel`
  * — the pattern's single most extreme point); target = measured move (head-
- * to-neckline height projected from entry).
+ * to-neckline height projected from the NECKLINE, not from entry, which may
+ * already sit past the neckline by the time the breakout closes).
  */
 export function buildHeadAndShouldersTradePlan({ pattern, breakout, rangeLevel } = {}) {
   if (!pattern?.necklineLevel) throw new Error('pattern must be a head_and_shoulders/inverse_head_and_shoulders result from findHeadAndShoulders');
   if (!breakout?.bar) throw new Error('breakout must be a confirmed neckline break (from scanForNecklineBreak)');
 
-  const entry = breakout.bar.close;
   const plan = {
     side: pattern.side,
-    entry,
+    entry: breakout.bar.close,
     stop: pattern.stopLevel,
-    target: measuredMoveTarget({ entry, height: pattern.height, side: pattern.side }),
+    target: measuredMoveTarget({ entry: pattern.necklineLevel, height: pattern.height, side: pattern.side }),
   };
   return withAlternateTarget(plan, rangeLevel);
 }
@@ -345,19 +346,20 @@ export function scanForTriangleBreakout(bars, triangle) {
  * Build a trade plan from a confirmed triangle breakout.
  * entry = close of the break candle; stop = the most recent swing point on
  * the OPPOSITE side of the triangle (the line that did NOT break); target =
- * measured move (the triangle's widest height, projected from entry).
+ * measured move (the triangle's widest height, projected from the BROKEN
+ * TRENDLINE's level at the breakout bar — `breakout.level` — not from entry,
+ * which may already sit past that line by the time the breakout closes).
  */
 export function buildTriangleTradePlan({ triangle, breakout, rangeLevel } = {}) {
   if (!triangle?.points) throw new Error('triangle must be a result from findTriangle');
   if (!breakout?.bar) throw new Error('breakout must be a confirmed triangle breakout (from scanForTriangleBreakout)');
 
-  const entry = breakout.bar.close;
   const stop = breakout.side === 'long' ? triangle.points.lower[1].price : triangle.points.upper[1].price;
   const plan = {
     side: breakout.side,
-    entry,
+    entry: breakout.bar.close,
     stop,
-    target: measuredMoveTarget({ entry, height: triangle.height, side: breakout.side }),
+    target: measuredMoveTarget({ entry: breakout.level, height: triangle.height, side: breakout.side }),
   };
   return withAlternateTarget(plan, rangeLevel);
 }
@@ -433,18 +435,19 @@ export function scanForFlagBreakout(bars, pattern) {
  * Build a trade plan from a confirmed flag/pennant breakout.
  * entry = close of the break candle; stop = the opposite edge of the
  * consolidation range; target = measured move (flagpole height projected
- * from entry — the standard "flagpole repeats" target rule).
+ * from the consolidation's BREAKOUT EDGE — `pattern.breakoutLevel` — the
+ * standard "flagpole repeats from the breakout point" rule, not from entry
+ * which may already sit past that edge by the time the breakout closes).
  */
 export function buildFlagTradePlan({ pattern, breakout, rangeLevel } = {}) {
   if (!pattern?.breakoutLevel) throw new Error('pattern must be a flag_pennant result from findFlagPennant');
   if (!breakout?.bar) throw new Error('breakout must be a confirmed flag breakout (from scanForFlagBreakout)');
 
-  const entry = breakout.bar.close;
   const plan = {
     side: pattern.side,
-    entry,
+    entry: breakout.bar.close,
     stop: pattern.stopLevel,
-    target: measuredMoveTarget({ entry, height: pattern.height, side: pattern.side }),
+    target: measuredMoveTarget({ entry: pattern.breakoutLevel, height: pattern.height, side: pattern.side }),
   };
   return withAlternateTarget(plan, rangeLevel);
 }

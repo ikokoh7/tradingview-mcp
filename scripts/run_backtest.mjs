@@ -400,6 +400,7 @@ async function backtestSymbol(symbol) {
 
     const plan = conf.plan;
     const rr = Math.abs(plan.target - plan.entry) / Math.abs(plan.entry - plan.stop);
+    if (rr < 1) continue; // hard 1:1 reward:risk floor — matches evaluateTradeSetup gate
     const sim = simulateOutcome(allBars, { entry: plan.entry, stop: plan.stop, target: plan.target, side: plan.side, startIndex: i });
 
     trades.push({

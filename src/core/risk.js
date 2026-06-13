@@ -152,10 +152,19 @@ export function evaluateTradeSetup({
   let minRequired;
   if (historicalWinRate !== undefined) {
     minRequired = minRewardPerRiskForWinRate({ winRate: historicalWinRate });
-    if (rewardPerRisk < minRequired.min_reward_per_risk) {
+  }
+  // Hard 1:1 reward:risk floor regardless of the curriculum's win-rate-based
+  // minimum — RR<1 trades are excluded across all strategies/combos.
+  const effectiveMinRewardPerRisk = Math.max(minRequired?.min_reward_per_risk ?? 0, 1);
+  if (rewardPerRisk < effectiveMinRewardPerRisk) {
+    if (minRequired && minRequired.min_reward_per_risk >= 1) {
       reasons.push(
         `reward:risk ${rewardPerRisk.toFixed(2)} is below the ${minRequired.min_reward_per_risk.toFixed(2)} ` +
         `minimum required to break even at a ${historicalWinRate}% win rate`
+      );
+    } else {
+      reasons.push(
+        `reward:risk ${rewardPerRisk.toFixed(2)} is below the 1.0 minimum reward:risk floor`
       );
     }
   }
@@ -168,7 +177,7 @@ export function evaluateTradeSetup({
     reasons,
     risk_reward: rr,
     reward_per_risk: rewardPerRisk,
-    min_reward_per_risk_required: minRequired?.min_reward_per_risk,
+    min_reward_per_risk_required: effectiveMinRewardPerRisk,
     position_size: sizing.position_size,
     ideal_position_size: sizing.ideal_position_size,
     capital_constrained: sizing.capital_constrained,

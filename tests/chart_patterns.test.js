@@ -81,7 +81,7 @@ describe('scanForNecklineBreak() + buildDoubleTopBottomTradePlan()', () => {
     assert.equal(plan.side, 'short');
     assert.equal(plan.entry, 95);
     assert.equal(plan.stop, 110.5);
-    assert.equal(plan.target, 95 - 10.5);
+    assert.equal(plan.target, 100 - 10.5); // measured move from the neckline (100), not entry (95)
     assert.equal(plan.alternate_target, 80);
   });
 
@@ -145,7 +145,7 @@ describe('buildHeadAndShouldersTradePlan()', () => {
     assert.equal(plan.side, 'long');
     assert.equal(plan.entry, 105);
     assert.equal(plan.stop, 85);
-    assert.equal(plan.target, 105 + 15);
+    assert.equal(plan.target, 100 + 15); // measured move from the neckline (100), not entry (105)
   });
 });
 
@@ -171,7 +171,7 @@ describe('findTriangle() / scanForTriangleBreakout() / buildTriangleTradePlan()'
     assert.equal(plan.side, 'long');
     assert.equal(plan.entry, 101);
     assert.equal(plan.stop, 95);
-    assert.equal(plan.target, 101 + triangle.height);
+    assert.equal(plan.target, breakout.level + triangle.height); // measured move from the broken trendline's level, not entry (101)
   });
 
   it('classifies a descending triangle (flat support, falling resistance) and confirms a breakout below', () => {
@@ -230,7 +230,7 @@ describe('findFlagPennant() / scanForFlagBreakout() / buildFlagTradePlan()', () 
     assert.equal(plan.side, 'long');
     assert.equal(plan.entry, 120);
     assert.equal(plan.stop, 113);
-    assert.equal(plan.target, 140);
+    assert.equal(plan.target, 138); // measured move from the consolidation's breakout edge (118), not entry (120)
   });
 
   it('returns null when the pole is not directional enough (choppy range)', () => {
