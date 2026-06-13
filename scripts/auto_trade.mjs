@@ -94,6 +94,7 @@ const CVD_WINDOW       = 14;     // rolling-window size for CVD divergence (Ch.1
 
 const STATE_PATH = join(ROOT, 'auto_trade_state.json');
 const LOG_PATH = join(ROOT, 'auto_trade.log');
+const EVENTS_PATH = join(ROOT, 'bot_events.jsonl');   // escalation feed read by the orchestrator agent
 
 function loadState() {
   if (!existsSync(STATE_PATH)) return {};
@@ -106,6 +107,59 @@ function log(line) {
   const stamped = `[${new Date().toISOString()}] ${line}`;
   console.log(stamped);
   appendFileSync(LOG_PATH, stamped + '\n');
+}
+
+// Append one structured escalation event for the orchestrator agent to consume.
+// severity: 'info' | 'warn' | 'error'. Never throws — escalation must not break a scan.
+function emitEvent(severity, type, fields = {}) {
+  try {
+    const rec = { ts: new Date().toISOString(), bot: 'spot', severity, type, ...fields };
+    appendFileSync(EVENTS_PATH, JSON.stringify(rec) + '\n');
+  } catch { /* escalation is best-effort */ }
+}
+
+// ---- Orchestrator control plane ------------------------------------------
+// The orchestrator agent writes orchestrator_config.json to enable/disable
+// strategies and filters based on measured win% / expectancy. This bot reads
+// the `spot` section once per pass and runs ONLY what's active — always clamped
+// to the hard-coded validated universe below: config can NARROW behavior, never
+// invent it (no new symbols, strategies, or filters). A missing or malformed
+// file fails OPEN to all-active (current behavior), never into a degraded state.
+const ORCH_CONFIG_PATH     = join(ROOT, 'orchestrator_config.json');
+const VALIDATED_STRATEGIES = new Set(['sfp', 'divergence', 'cvd_divergence', 'levels', 'fibonacci', 'market_structure']);
+const VALIDATED_FILTERS    = new Set(['pinbar_bias_4h', 'daily_structure', 'vwap_bias', 'value_area_bias']);
+
+function loadOrchestratorConfig() {
+  const failOpen = { active_strategies: new Set(VALIDATED_STRATEGIES), active_filters: {} };
+  if (!existsSync(ORCH_CONFIG_PATH)) return failOpen;
+  try {
+    const cfg = JSON.parse(readFileSync(ORCH_CONFIG_PATH, 'utf8'));
+    const section = cfg.spot ?? {};
+    const declared = Array.isArray(section.active_strategies) ? section.active_strategies : null;
+    // Clamp to the validated universe — config can only narrow, never extend.
+    const active = declared
+      ? new Set(declared.filter(s => VALIDATED_STRATEGIES.has(s)))
+      : new Set(VALIDATED_STRATEGIES);
+    if (active.size === 0) {
+      log('orchestrator_config: spot.active_strategies empty after clamp — failing open to all strategies');
+      emitEvent('warn', 'config_fail_open', { reason: 'spot.active_strategies empty after clamp' });
+      return failOpen;
+    }
+    const active_filters = (section.active_filters && typeof section.active_filters === 'object') ? section.active_filters : {};
+    return { active_strategies: active, active_filters };
+  } catch (e) {
+    log(`orchestrator_config: unreadable (${e.message}) — failing open to all strategies/filters`);
+    emitEvent('warn', 'config_fail_open', { reason: `unreadable: ${e.message}` });
+    return failOpen;
+  }
+}
+
+// A filter runs unless the config explicitly disables it (fail-open). Filters
+// outside the validated set can never be turned on from config.
+function filterEnabled(orch, name) {
+  if (!VALIDATED_FILTERS.has(name)) return false;
+  const f = orch.active_filters?.[name];
+  return f ? f.enabled !== false : true;
 }
 
 // Exchange LOT_SIZE/MIN_NOTIONAL filters are enforced server-side and reject
@@ -361,6 +415,9 @@ const usdt = balanceOf('USDT');
 
 log(`scan start — interval=${INTERVAL}/${INTERVAL_HTF} symbols=${SYMBOLS.join(',')} usdt_balance=${usdt.toFixed(2)}`);
 
+const orch = loadOrchestratorConfig();
+log(`orchestrator config — strategies: ${[...orch.active_strategies].join(',')} | filters: ${[...VALIDATED_FILTERS].map(f => `${f}=${filterEnabled(orch, f) ? 'on' : 'off'}`).join(' ')}`);
+
 for (const symbol of SYMBOLS) {
   try {
     // Fetch both timeframes + open orders in parallel.
@@ -421,8 +478,10 @@ for (const symbol of SYMBOLS) {
     const htfBias          = ctx4h ? findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) : null;
 
     // Apply HTF pinbar bias: discard any signal whose direction opposes the 4H pinbar read
-    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, divergenceSignal, cvdDivergenceSignal].filter(Boolean);
-    if (htfBias) {
+    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, divergenceSignal, cvdDivergenceSignal]
+      .filter(Boolean)
+      .filter(s => orch.active_strategies.has(s.strategy));   // orchestrator: run only active strategies
+    if (htfBias && filterEnabled(orch, 'pinbar_bias_4h')) {
       const biasSide = htfBias.direction === 'bullish' ? 'long' : 'short';
       const before = signals.length;
       signals = signals.filter(s => s.plan.side === biasSide);
@@ -436,7 +495,7 @@ for (const symbol of SYMBOLS) {
     // high-conviction reversal regardless of the macro trend (Ch.6 + Ch.10/11).
     // All other counter-trend signals (lone SFP, fibonacci, etc.) are still removed.
     const dailyBias = findDailyStructureBias(klines1d);
-    if (dailyBias) {
+    if (dailyBias && filterEnabled(orch, 'daily_structure')) {
       const biasSide  = dailyBias.direction === 'bullish' ? 'long' : 'short';
       const otherSide = biasSide === 'long' ? 'short' : 'long';
       const counterDiv    = signals.find(s => s.strategy === 'divergence' && s.plan.side === otherSide);
@@ -457,7 +516,7 @@ for (const symbol of SYMBOLS) {
     // the 4H timeframe"), so the 4H RSI divergence signal is exempt — a 15m
     // VWAP read must not veto an HTF swing setup.
     const vwapBias = classifyVWAPBias(klines);
-    if (vwapBias.bias) {
+    if (vwapBias.bias && filterEnabled(orch, 'vwap_bias')) {
       const before = signals.length;
       signals = signals.filter(s => s.strategy === 'divergence' || s.plan.side === vwapBias.bias);
       if (signals.length < before)
@@ -468,8 +527,12 @@ for (const symbol of SYMBOLS) {
     // — value area computed over the same 15m visible range used for rangeHigh/rangeLow.
     // VPVR is "one of the best LTF tools to hand you a bias" (Ch.14) — a lower-TF
     // fair-value read, so it too exempts the 4H RSI divergence swing signal.
-    const valueAreaBias = classifyValueAreaBias(klines);
-    if (valueAreaBias.bias) {
+    const vaCfg = orch.active_filters?.value_area_bias ?? {};
+    const vaOpts = {};
+    if (Number.isInteger(vaCfg.bins)) vaOpts.bins = vaCfg.bins;
+    if (typeof vaCfg.value_area_percent === 'number') vaOpts.valueAreaPercent = vaCfg.value_area_percent;
+    const valueAreaBias = classifyValueAreaBias(klines, vaOpts);
+    if (valueAreaBias.bias && filterEnabled(orch, 'value_area_bias')) {
       const before = signals.length;
       signals = signals.filter(s => s.strategy === 'divergence' || s.plan.side === valueAreaBias.bias);
       if (signals.length < before)
@@ -590,6 +653,7 @@ for (const symbol of SYMBOLS) {
           orders.push(order);
         } catch (err) {
           log(`${symbol}: ladder rung FAILED (price ${rung.price}, qty ${rung.size}) — ${err.message}`);
+          emitEvent('error', 'order_failed', { symbol, kind: 'ladder_rung', price: rung.price, qty: rung.size, message: err.message });
         }
       }
       state[symbol] = { ...state[symbol], outcome: 'executed', orders };
@@ -601,8 +665,23 @@ for (const symbol of SYMBOLS) {
       log(`${symbol}: order result — ${JSON.stringify(order)}`);
       state[symbol] = { ...state[symbol], outcome: 'executed', orders: [order] };
     }
+
+    // Spot has no exchange-side exit, so this is an activity event only — not a
+    // resolvable ledger trade. Spot win%/expectancy comes from run_backtest.mjs.
+    emitEvent('info', 'trade_executed', {
+      symbol,
+      combo: confluence.agreeing_strategies.slice().sort().join('+'),
+      side: exec.order_side,
+      entry: plan.entry,
+      stop: plan.stop,
+      planned_rr: Number(gate.reward_per_risk.toFixed(2)),
+      qty: quantity,
+      order_count: state[symbol].orders?.length ?? 0,
+      signal_key: combinedKey,
+    });
   } catch (err) {
     log(`${symbol}: ERROR — ${err.message}`);
+    emitEvent('error', 'scan_error', { symbol, message: err.message });
   }
 }
 

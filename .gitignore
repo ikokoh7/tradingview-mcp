@@ -9,3 +9,7 @@ trading_notes/
 auto_trade_state.json
 .trade_watch_state.json
 backtest_cache/
+# orchestrator runtime data (append-only logs + per-cycle cursor; created at runtime)
+trade_ledger.jsonl
+bot_events.jsonl
+orchestrator/.cursor.json

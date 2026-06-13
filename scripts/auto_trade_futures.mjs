@@ -69,6 +69,8 @@ const KILL_ZONES = [
 
 const STATE_PATH = join(ROOT, 'auto_trade_futures_state.json');
 const LOG_PATH   = join(ROOT, 'auto_trade_futures.log');
+const EVENTS_PATH = join(ROOT, 'bot_events.jsonl');    // escalation feed read by the orchestrator agent
+const LEDGER_PATH = join(ROOT, 'trade_ledger.jsonl');  // resolved-trade ledger read by the orchestrator agent
 
 function loadState() {
   if (!existsSync(STATE_PATH)) return {};
@@ -81,6 +83,66 @@ function log(line) {
   const stamped = `[${new Date().toISOString()}] ${line}`;
   console.log(stamped);
   appendFileSync(LOG_PATH, stamped + '\n');
+}
+
+// Append one structured escalation event for the orchestrator agent. Never throws.
+function emitEvent(severity, type, fields = {}) {
+  try {
+    const rec = { ts: new Date().toISOString(), bot: 'futures', severity, type, ...fields };
+    appendFileSync(EVENTS_PATH, JSON.stringify(rec) + '\n');
+  } catch { /* escalation is best-effort */ }
+}
+// Append one trade-lifecycle record (phase 'open' | 'close') for the orchestrator. Never throws.
+function appendLedger(record) {
+  try {
+    appendFileSync(LEDGER_PATH, JSON.stringify({ ts: new Date().toISOString(), bot: 'futures', ...record }) + '\n');
+  } catch { /* best-effort */ }
+}
+
+// ---- Orchestrator control plane ------------------------------------------
+// The orchestrator agent writes orchestrator_config.json to enable/disable
+// strategies and filters based on measured win% / expectancy. This bot reads
+// the `futures` section once per pass and runs ONLY what's active — always
+// clamped to the hard-coded validated universe below: config can NARROW
+// behavior, never invent it. The kill-zone window is a fixed curriculum
+// constraint and is intentionally NOT agent-controllable. Futures has no
+// daily_structure filter (it shorts freely). A missing or malformed file fails
+// OPEN to all-active (current behavior), never into a degraded state.
+const ORCH_CONFIG_PATH     = join(ROOT, 'orchestrator_config.json');
+const VALIDATED_STRATEGIES = new Set(['sfp', 'divergence', 'cvd_divergence', 'levels', 'fibonacci', 'market_structure', 'pinbar']);
+const VALIDATED_FILTERS    = new Set(['pinbar_bias_4h', 'vwap_bias', 'value_area_bias']);
+
+function loadOrchestratorConfig() {
+  const failOpen = { active_strategies: new Set(VALIDATED_STRATEGIES), active_filters: {} };
+  if (!existsSync(ORCH_CONFIG_PATH)) return failOpen;
+  try {
+    const cfg = JSON.parse(readFileSync(ORCH_CONFIG_PATH, 'utf8'));
+    const section = cfg.futures ?? {};
+    const declared = Array.isArray(section.active_strategies) ? section.active_strategies : null;
+    // Clamp to the validated universe — config can only narrow, never extend.
+    const active = declared
+      ? new Set(declared.filter(s => VALIDATED_STRATEGIES.has(s)))
+      : new Set(VALIDATED_STRATEGIES);
+    if (active.size === 0) {
+      log('orchestrator_config: futures.active_strategies empty after clamp — failing open to all strategies');
+      emitEvent('warn', 'config_fail_open', { reason: 'futures.active_strategies empty after clamp' });
+      return failOpen;
+    }
+    const active_filters = (section.active_filters && typeof section.active_filters === 'object') ? section.active_filters : {};
+    return { active_strategies: active, active_filters };
+  } catch (e) {
+    log(`orchestrator_config: unreadable (${e.message}) — failing open to all strategies/filters`);
+    emitEvent('warn', 'config_fail_open', { reason: `unreadable: ${e.message}` });
+    return failOpen;
+  }
+}
+
+// A filter runs unless the config explicitly disables it (fail-open). Filters
+// outside the validated set can never be turned on from config.
+function filterEnabled(orch, name) {
+  if (!VALIDATED_FILTERS.has(name)) return false;
+  const f = orch.active_filters?.[name];
+  return f ? f.enabled !== false : true;
 }
 
 async function getSymbolFilters(symbol) {
@@ -310,6 +372,9 @@ if (!activeSession) {
 }
 log(`${activeSession.name} kill zone active — proceeding`);
 
+const orch = loadOrchestratorConfig();
+log(`orchestrator config — strategies: ${[...orch.active_strategies].join(',')} | filters: ${[...VALIDATED_FILTERS].map(f => `${f}=${filterEnabled(orch, f) ? 'on' : 'off'}`).join(' ')}`);
+
 for (const symbol of SYMBOLS) {
   try {
     // Check for an open position first — don't re-enter while one is live
@@ -321,10 +386,40 @@ for (const symbol of SYMBOLS) {
       continue;
     }
 
-    // Position gone but state still says open/executing — SL/TP was hit or manually closed
+    // Position gone but state still says open/executing — SL/TP was hit or manually closed.
+    // Resolve win/loss by scanning 15m bars since entry for the first SL/TP touch.
+    // SL/TP are STOP_MARKET/TAKE_PROFIT_MARKET (trigger on a wick touch), so a high/low
+    // touch is the correct trigger test. Fixed-R outcome, matching the backtest model:
+    // win = planned R:R, loss = -1R. A single bar spanning both levels is booked as a
+    // loss (conservative stop-first assumption). No first touch found => 'manual'.
     if (state[symbol]?.outcome === 'open' || state[symbol]?.outcome === 'executing') {
-      log(`${symbol}: position closed (SL/TP hit or manual close) — ready for next setup`);
-      state[symbol] = { ...state[symbol], outcome: 'closed', closed_at: new Date().toISOString() };
+      const st = state[symbol];
+      let exitReason = 'manual', win = null, realizedR = null;
+      try {
+        const { klines: rk } = await getKlines({ symbol, interval: INTERVAL, limit: 150 });
+        const since = st.executed_at ? Date.parse(st.executed_at) : 0;
+        const isLong = st.position_side === 'long';
+        for (const b of rk) {
+          if (b.open_time < since) continue;
+          const hitSL = isLong ? b.low <= st.sl_price : b.high >= st.sl_price;
+          const hitTP = isLong ? b.high >= st.tp_price : b.low <= st.tp_price;
+          if (hitSL) { exitReason = 'sl'; win = false; break; }
+          if (hitTP) { exitReason = 'tp'; win = true; break; }
+        }
+        realizedR = win === true ? (st.planned_rr ?? null) : win === false ? -1 : null;
+      } catch (e) {
+        emitEvent('warn', 'ledger_resolution_failed', { symbol, message: e.message });
+      }
+      log(`${symbol}: position closed (${exitReason}${win === null ? '' : win ? ' — WIN' : ' — LOSS'}) — ready for next setup`);
+      appendLedger({
+        phase: 'close', id: st.last_signal_key ?? null, symbol,
+        combo: st.combo ?? null, side: st.position_side ?? null,
+        entry: st.entry_price ?? null, stop: st.sl_price ?? null, target: st.tp_price ?? null,
+        exit_reason: exitReason, win, realized_r: realizedR,
+        opened_at: st.executed_at ?? null, closed_at: new Date().toISOString(),
+      });
+      emitEvent('info', 'trade_close', { symbol, combo: st.combo ?? null, exit_reason: exitReason, win, realized_r: realizedR });
+      state[symbol] = { ...st, outcome: 'closed', closed_at: new Date().toISOString(), exit_reason: exitReason, win, realized_r: realizedR };
     }
 
     // Fetch klines — futures trades both directions so no daily bias filter;
@@ -369,13 +464,15 @@ for (const symbol of SYMBOLS) {
     const divergenceSignal = ctx4h ? findFreshDivergenceSignal(klines4h, ctx4h) : null;
     const htfBias          = ctx4h ? findHTFPinbarBias(klines4h, ctx4h, swingHighs4h, swingLows4h) : null;
 
-    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, pinbarSignal, divergenceSignal, cvdDivergenceSignal].filter(Boolean);
+    let signals = [sfpSignal, levelsSignal, fibSignal, structureSignal, pinbarSignal, divergenceSignal, cvdDivergenceSignal]
+      .filter(Boolean)
+      .filter(s => orch.active_strategies.has(s.strategy));   // orchestrator: run only active strategies
 
     // 4H pinbar bias — filter opposing signals, with divergence+levels exemption.
     // Same logic as the spot bot's daily bias exemption: a divergence+levels pair
     // pointing counter to the 4H pinbar is a high-conviction reversal (Ch.6 + Ch.10/11)
     // and should not be blocked on a futures account where both directions are valid.
-    if (htfBias) {
+    if (htfBias && filterEnabled(orch, 'pinbar_bias_4h')) {
       const biasSide  = htfBias.direction === 'bullish' ? 'long' : 'short';
       const otherSide = biasSide === 'long' ? 'short' : 'long';
       const counterDiv    = signals.find(s => s.strategy === 'divergence' && s.plan.side === otherSide);
@@ -398,7 +495,7 @@ for (const symbol of SYMBOLS) {
     // the 4H timeframe"), so the 4H RSI divergence signal is exempt — a 15m
     // VWAP read must not veto an HTF swing setup.
     const vwapBias = classifyVWAPBias(klines);
-    if (vwapBias.bias) {
+    if (vwapBias.bias && filterEnabled(orch, 'vwap_bias')) {
       const before = signals.length;
       signals = signals.filter(s => s.strategy === 'divergence' || s.plan.side === vwapBias.bias);
       if (signals.length < before)
@@ -409,8 +506,12 @@ for (const symbol of SYMBOLS) {
     // — value area computed over the same 15m visible range used for rangeHigh/rangeLow.
     // VPVR is "one of the best LTF tools to hand you a bias" (Ch.14) — a lower-TF
     // fair-value read, so it too exempts the 4H RSI divergence swing signal.
-    const valueAreaBias = classifyValueAreaBias(klines);
-    if (valueAreaBias.bias) {
+    const vaCfg = orch.active_filters?.value_area_bias ?? {};
+    const vaOpts = {};
+    if (Number.isInteger(vaCfg.bins)) vaOpts.bins = vaCfg.bins;
+    if (typeof vaCfg.value_area_percent === 'number') vaOpts.valueAreaPercent = vaCfg.value_area_percent;
+    const valueAreaBias = classifyValueAreaBias(klines, vaOpts);
+    if (valueAreaBias.bias && filterEnabled(orch, 'value_area_bias')) {
       const before = signals.length;
       signals = signals.filter(s => s.strategy === 'divergence' || s.plan.side === valueAreaBias.bias);
       if (signals.length < before)
@@ -505,6 +606,8 @@ for (const symbol of SYMBOLS) {
     await setMarginType({ symbol, marginType: MARGIN_TYPE });
 
     // Commit dedup key before placing orders — prevents re-fire if execution throws
+    const combo = confluence.agreeing_strategies.slice().sort().join('+');
+    const plannedRr = Number(gate.reward_per_risk.toFixed(2));
     state[symbol] = {
       last_signal_key: combinedKey,
       outcome: 'executing',
@@ -512,9 +615,19 @@ for (const symbol of SYMBOLS) {
       entry_price: plan.entry,
       sl_price: slPrice,
       tp_price: tpPrice,
+      combo,                       // recorded so the close phase can book the ledger
+      planned_rr: plannedRr,       // win R = planned R:R; loss = -1R (fixed-R model)
       executed_at: new Date().toISOString(),
     };
     saveState(state);
+
+    // Ledger: open phase. The close phase is booked when the position is later
+    // detected gone (top of the loop), pairing on `id` = last_signal_key.
+    appendLedger({
+      phase: 'open', id: combinedKey, symbol, combo, side: plan.side,
+      entry: plan.entry, stop: slPrice, target: tpPrice, planned_rr: plannedRr,
+    });
+    emitEvent('info', 'trade_open', { symbol, combo, side: plan.side, entry: plan.entry, planned_rr: plannedRr });
 
     // Place entry ladder
     const entryOrders = [];
@@ -528,6 +641,7 @@ for (const symbol of SYMBOLS) {
           entryOrders.push(order);
         } catch (err) {
           log(`${symbol}: entry rung FAILED (price ${rung.price}, qty ${rung.size}) — ${err.message}`);
+          emitEvent('error', 'order_failed', { symbol, kind: 'ladder_rung', price: rung.price, qty: rung.size, message: err.message });
         }
       }
     } else {
@@ -538,6 +652,7 @@ for (const symbol of SYMBOLS) {
         entryOrders.push(order);
       } catch (err) {
         log(`${symbol}: entry order FAILED — ${err.message}`);
+        emitEvent('error', 'order_failed', { symbol, kind: 'market_entry', message: err.message });
       }
     }
 
@@ -571,6 +686,7 @@ for (const symbol of SYMBOLS) {
 
   } catch (err) {
     log(`${symbol}: ERROR — ${err.message}`);
+    emitEvent('error', 'scan_error', { symbol, message: err.message });
   }
 }
 
