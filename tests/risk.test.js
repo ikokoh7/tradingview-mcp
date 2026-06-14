@@ -45,6 +45,26 @@ describe('positionSize()', () => {
     assert.equal(position_size, 200);
   });
 
+  it('caps the size at maxPositionPercent of capital even when availableCapital would allow more', () => {
+    // tight 0.1%-ish stop -> ideal size would consume the entire account
+    const result = positionSize({ capital: 1000, riskPercent: 1, stopLossPercent: 0.1, availableCapital: 1000, maxPositionPercent: 15 });
+    assert.ok(result.ideal_position_size > 150);
+    assert.equal(result.position_size, 150);
+    assert.equal(result.capital_constrained, true);
+  });
+
+  it('does not apply a maxPositionPercent cap when the ideal size is already within it', () => {
+    const result = positionSize({ capital: 1000, riskPercent: 1, stopLossPercent: 5, maxPositionPercent: 50 });
+    assert.equal(result.position_size, 200);
+    assert.equal(result.capital_constrained, false);
+  });
+
+  it('uses the tighter of availableCapital and maxPositionPercent as the ceiling', () => {
+    // availableCapital (80) is tighter than 15% of capital (150)
+    const result = positionSize({ capital: 1000, riskPercent: 1, stopLossPercent: 0.1, availableCapital: 80, maxPositionPercent: 15 });
+    assert.equal(result.position_size, 80);
+  });
+
   it('rejects non-positive capital', () => {
     assert.throws(() => positionSize({ capital: 0, riskPercent: 1, stopLossPercent: 5 }));
   });

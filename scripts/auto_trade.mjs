@@ -93,6 +93,7 @@ const INTERVAL         = '15m';
 const INTERVAL_HTF     = '4h';   // Ch.10/11: divergence "minimum 4-hour timeframe"; Ch.3: pinbar is HTF bias
 const INTERVAL_DAILY   = '1d';   // macro structural bias — daily BOS/CHoCH establishes the trend filters below
 const RISK_PERCENT     = 1;      // bottom of the curriculum's 1-3% per-trade cap
+const MAX_POSITION_PERCENT = 15; // ceiling on single-trade size as % of capital, independent of stop tightness
 const HISTORICAL_WIN_RATE = 73;  // measured: 8W/11 resolved trades (2026-06-13), after enforcing a hard 1:1 reward:risk floor (RR<1 setups removed from the gate and backtest); avg R:R 1:5.07, total +17.1R / 11 trades
 const FRESHNESS_BARS   = 2;      // 15m signals: act only on signals confirmed within the last N closed bars
 const HTF_FRESHNESS_BARS = 3;    // 4H signals: slightly wider window (3 × 4H = 12h)
@@ -605,7 +606,7 @@ for (const symbol of SYMBOLS) {
       gate = evaluateTradeSetup({
         capital: usdt, riskPercent: RISK_PERCENT, leverage: 1,
         entry: plan.entry, stop: plan.stop, target: plan.target, side: plan.side,
-        historicalWinRate: HISTORICAL_WIN_RATE, availableCapital: usdt,
+        historicalWinRate: HISTORICAL_WIN_RATE, availableCapital: usdt, maxPositionPercent: MAX_POSITION_PERCENT,
       });
     } catch (err) {
       // The agreeing strategy's plan can go stale between signal detection and

@@ -68,6 +68,7 @@ const INTERVAL_HTF      = '4h';
 const LEVERAGE          = 2;       // curriculum cap is 5x; 2x is the conservative starting point
 const MARGIN_TYPE       = 'ISOLATED';
 const RISK_PERCENT      = 1;
+const MAX_POSITION_PERCENT = 15; // ceiling on single-trade notional as % of capital, independent of stop tightness
 const HISTORICAL_WIN_RATE = 52;  // measured: 12W/23 resolved trades (2026-06-13), after enforcing a hard 1:1 reward:risk floor (RR<1 setups removed from the gate and backtest) on top of the pinbar dedup and chart_pattern target fixes. Win rate is lower than the old 61% but expectancy is far higher (avg R:R 1:6.6, total +101.6R / 23 trades)
 const FRESHNESS_BARS    = 2;
 const HTF_FRESHNESS_BARS = 3;
@@ -640,7 +641,7 @@ for (const symbol of SYMBOLS) {
       gate = evaluateTradeSetup({
         capital: usdt, riskPercent: RISK_PERCENT, leverage: LEVERAGE,
         entry: plan.entry, stop: plan.stop, target: plan.target, side: plan.side,
-        historicalWinRate: HISTORICAL_WIN_RATE, availableCapital: usdt * LEVERAGE,
+        historicalWinRate: HISTORICAL_WIN_RATE, availableCapital: usdt * LEVERAGE, maxPositionPercent: MAX_POSITION_PERCENT,
       });
     } catch (err) {
       // The agreeing strategy's plan can go stale between signal detection and

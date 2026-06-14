@@ -26,22 +26,31 @@ function requireFiniteInRange(value, name, min, max) {
 // risk the target %). Pass `availableCapital` (the actual deployable balance)
 // to cap the result at what's executable — under-risking by capping is always
 // conservative/acceptable per the curriculum's caps (they're a ceiling, not a floor).
-export function positionSize({ capital, riskPercent, stopLossPercent, availableCapital } = {}) {
+//
+// `maxPositionPercent` is a second, independent ceiling expressed as % of
+// `capital` — without it, a tight enough stop can drive idealSize up to (and
+// `availableCapital` lets it consume) the entire account in one trade. This
+// caps single-trade concentration regardless of how tight the stop is.
+export function positionSize({ capital, riskPercent, stopLossPercent, availableCapital, maxPositionPercent } = {}) {
   const cap = requirePositiveFinite(capital, 'capital');
   const risk = requireFiniteInRange(riskPercent, 'riskPercent', 0, 100);
   const stopDistance = requirePositiveFinite(stopLossPercent, 'stopLossPercent');
   const riskAmount = cap * (risk / 100);
   const idealSize = riskAmount / (stopDistance / 100);
 
-  if (availableCapital === undefined) {
+  let ceiling;
+  if (availableCapital !== undefined) ceiling = requirePositiveFinite(availableCapital, 'availableCapital');
+  if (maxPositionPercent !== undefined) {
+    const maxPct = requireFiniteInRange(maxPositionPercent, 'maxPositionPercent', 0, 100);
+    const maxSize = cap * (maxPct / 100);
+    ceiling = ceiling === undefined ? maxSize : Math.min(ceiling, maxSize);
+  }
+
+  if (ceiling === undefined || idealSize <= ceiling) {
     return { risk_amount: riskAmount, position_size: idealSize, ideal_position_size: idealSize, capital_constrained: false };
   }
-  const avail = requirePositiveFinite(availableCapital, 'availableCapital');
-  if (idealSize <= avail) {
-    return { risk_amount: riskAmount, position_size: idealSize, ideal_position_size: idealSize, capital_constrained: false };
-  }
-  const actualRiskAmount = avail * (stopDistance / 100);
-  return { risk_amount: actualRiskAmount, position_size: avail, ideal_position_size: idealSize, capital_constrained: true };
+  const actualRiskAmount = ceiling * (stopDistance / 100);
+  return { risk_amount: actualRiskAmount, position_size: ceiling, ideal_position_size: idealSize, capital_constrained: true };
 }
 
 // R:R = (entry - stop) / (target - entry) for longs; mirrored for shorts
@@ -142,6 +151,7 @@ export function evaluateTradeSetup({
   side = 'long',
   historicalWinRate,
   availableCapital,
+  maxPositionPercent,
 } = {}) {
   const limits = checkRiskLimits({ riskPercent, leverage });
   const rr = riskRewardRatio({ entry, stop, target, side });
@@ -170,7 +180,7 @@ export function evaluateTradeSetup({
   }
 
   const stopLossPercent = (Math.abs(entry - stop) / entry) * 100;
-  const sizing = positionSize({ capital, riskPercent, stopLossPercent, availableCapital });
+  const sizing = positionSize({ capital, riskPercent, stopLossPercent, availableCapital, maxPositionPercent });
 
   return {
     passes: reasons.length === 0,
