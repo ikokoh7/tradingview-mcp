@@ -50,8 +50,15 @@ const HTF_FRESHNESS_BARS = 3;
 const RSI_PERIOD       = 14;
 const CVD_WINDOW       = 14;    // rolling-window size for CVD divergence — same as auto_trade_futures.mjs
 const MAX_HOLD         = 100;
-const PAGES            = 4;     // 4 × 1000 = 4000 bars ≈ 40 days (kill-zone filter needs larger sample)
-const HTF_PAGES        = 2;     // 2 × 500 = 1000 4H bars (~166 days, covers the 40-day 15m window)
+let PAGES              = 4;     // 4 × 1000 = 4000 bars ≈ 40 days (kill-zone filter needs larger sample; override with --days=N)
+let HTF_PAGES          = 2;     // 4H pages of 1000 bars — scaled with --days to cover the 15m window
+// Round-trip taker fee per trade, charged on entry and exit. Binance USDM
+// futures standard taker is 0.05%/side; override with --fee=0.0002 (maker) etc.
+let FEE_RATE           = 0.0005;
+// Minimum stop distance as a fraction of entry price. Setups with a tighter
+// stop are skipped — a sub-0.5% stop on a 15m chart gets wicked out on noise and
+// makes fees an unrealistically large fraction of risk. Override with --min-stop=0.003.
+let MIN_STOP_PCT       = 0.005;
 // Kill zones — London Open and NY Open (UTC hours)
 const KILL_ZONES = [
   { startUtc: 7,  endUtc: 10 },
@@ -121,7 +128,14 @@ async function fetchHistory(symbol, interval, pages, limitPerPage = 1000) {
   let allBars = [];
   let endTime = undefined;
   for (let p = 0; p < pages; p++) {
-    const page = await fetchKlinesPage(symbol, interval, limitPerPage, endTime);
+    let page;
+    for (let attempt = 1; ; attempt++) {
+      try { page = await fetchKlinesPage(symbol, interval, limitPerPage, endTime); break; }
+      catch (e) {
+        if (attempt >= 5) throw e;
+        await new Promise(r => setTimeout(r, 500 * attempt));
+      }
+    }
     if (!page.length) break;
     allBars = [...page, ...allBars];
     endTime = page[0].open_time - 1;
@@ -349,7 +363,7 @@ async function backtestSymbol(symbol) {
   process.stdout.write(`${symbol}: fetching history... `);
   const [allBars, allBars4h] = await Promise.all([
     fetchHistory(symbol, INTERVAL,     PAGES,     1000),
-    fetchHistory(symbol, INTERVAL_HTF, HTF_PAGES, 500),
+    fetchHistory(symbol, INTERVAL_HTF, HTF_PAGES, 1000),
   ]);
   console.log(`${allBars.length} × 15m, ${allBars4h.length} × 4H closed bars`);
 
@@ -448,9 +462,18 @@ async function backtestSymbol(symbol) {
     seenKeys.add(key);
 
     const plan = conf.plan;
+    if (Math.abs(plan.entry - plan.stop) / plan.entry < MIN_STOP_PCT) continue; // skip unrealistically tight stops
     const rr = Math.abs(plan.target - plan.entry) / Math.abs(plan.entry - plan.stop);
     if (rr < 1) continue; // hard 1:1 reward:risk floor — matches evaluateTradeSetup gate
     const sim = simulateOutcome(allBars, { entry: plan.entry, stop: plan.stop, target: plan.target, side: plan.side, startIndex: i });
+
+    const risk = Math.abs(plan.entry - plan.stop);
+    let grossR = null, netR = null, feeR = null;
+    if (sim.outcome !== 'open' && sim.exitPrice != null && risk > 0) {
+      grossR = (plan.side === 'long' ? sim.exitPrice - plan.entry : plan.entry - sim.exitPrice) / risk;
+      feeR   = FEE_RATE * (plan.entry + sim.exitPrice) / risk;
+      netR   = grossR - feeR;
+    }
 
     trades.push({
       symbol,
@@ -462,6 +485,9 @@ async function backtestSymbol(symbol) {
       stop:       plan.stop,
       target:     plan.target,
       rr:         Math.round(rr * 100) / 100,
+      grossR:     grossR != null ? Math.round(grossR * 1000) / 1000 : null,
+      feeR:       feeR   != null ? Math.round(feeR   * 1000) / 1000 : null,
+      netR:       netR   != null ? Math.round(netR   * 1000) / 1000 : null,
       ...sim,
     });
   }
@@ -493,8 +519,20 @@ function summarise(trades) {
     if (t.outcome === 'win') byCombination[k].wins++;
   }
 
+  const withR    = resolved.filter(t => t.netR != null);
+  const round2   = n => Math.round(n * 100) / 100;
+  const mean     = arr => arr.length ? arr.reduce((s, x) => s + x, 0) / arr.length : null;
+  const grossExp = withR.length ? round2(mean(withR.map(t => t.grossR))) : null;
+  const netExp   = withR.length ? round2(mean(withR.map(t => t.netR)))   : null;
+  const totalNetR = withR.length ? round2(withR.reduce((s, t) => s + t.netR, 0)) : null;
+  const avgFeeR  = withR.length ? round2(mean(withR.map(t => t.feeR)))    : null;
+  const netWins  = withR.filter(t => t.netR > 0).length;
+  const netWinRate = withR.length ? Math.round((netWins / withR.length) * 100) : null;
+  const flippedByFees = withR.filter(t => t.grossR > 0 && t.netR <= 0).length;
+
   return { total: trades.length, wins: wins.length, losses: losses.length, open: open.length,
-           winRate, avgRR, avgBars, byCombination };
+           winRate, avgRR, avgBars, byCombination,
+           grossExp, netExp, totalNetR, avgFeeR, netWinRate, flippedByFees };
 }
 
 function printSummary(label, stats) {
@@ -502,9 +540,12 @@ function printSummary(label, stats) {
   console.log(`  ${label}`);
   console.log(`${'─'.repeat(52)}`);
   console.log(`  Total trades:   ${stats.total}  (${stats.wins}W / ${stats.losses}L / ${stats.open} open)`);
-  console.log(`  Win rate:       ${stats.winRate != null ? stats.winRate + '%' : 'n/a'} (resolved trades only)`);
+  console.log(`  Win rate:       ${stats.winRate != null ? stats.winRate + '%' : 'n/a'} (gross, hit target before stop)`);
+  console.log(`  Net win rate:   ${stats.netWinRate != null ? stats.netWinRate + '%' : 'n/a'} (trades net-positive after fees)`);
   console.log(`  Avg R:R setup:  ${stats.avgRR != null ? '1:' + stats.avgRR : 'n/a'}`);
   console.log(`  Avg bars held:  ${stats.avgBars != null ? stats.avgBars : 'n/a'}`);
+  console.log(`  Expectancy:     ${stats.grossExp != null ? stats.grossExp + 'R gross' : 'n/a'} → ${stats.netExp != null ? stats.netExp + 'R net/trade' : 'n/a'} (fee drag ${stats.avgFeeR != null ? stats.avgFeeR + 'R' : 'n/a'})`);
+  console.log(`  Total net R:    ${stats.totalNetR != null ? stats.totalNetR + 'R' : 'n/a'}  (${stats.flippedByFees ?? 0} gross wins flipped negative by fees)`);
   if (Object.keys(stats.byCombination).length) {
     console.log(`  By strategy combination:`);
     for (const [combo, s] of Object.entries(stats.byCombination)) {
@@ -516,13 +557,45 @@ function printSummary(label, stats) {
 
 // ---- Main -------------------------------------------------------------------
 
+// --days=N overrides the lookback for both 15m (96 bars/day) and 4H (6 bars/day), 1000 bars/page.
+const daysArg = process.argv.find(a => a.startsWith('--days='));
+if (daysArg) {
+  const days = Number(daysArg.split('=')[1]);
+  if (Number.isFinite(days) && days > 0) {
+    PAGES     = Math.max(1, Math.ceil(days * 96 / 1000));
+    HTF_PAGES = Math.max(1, Math.ceil((days * 6 + HTF_WINDOW_SIZE) / 1000));
+  }
+}
+
+// --fee=R overrides the round-trip taker fee rate per side (default 0.0005 = 0.05% USDM futures).
+const feeArg = process.argv.find(a => a.startsWith('--fee='));
+if (feeArg) {
+  const f = Number(feeArg.split('=')[1]);
+  if (Number.isFinite(f) && f >= 0) FEE_RATE = f;
+}
+
+// --min-stop=R overrides the minimum stop distance as a fraction of entry (0 to disable the floor).
+const minStopArg = process.argv.find(a => a.startsWith('--min-stop='));
+if (minStopArg) {
+  const m = Number(minStopArg.split('=')[1]);
+  if (Number.isFinite(m) && m >= 0) MIN_STOP_PCT = m;
+}
+
+// --symbols=A,B,C overrides the symbol universe with an explicit list (e.g. a watchlist).
+const symbolsArg = process.argv.find(a => a.startsWith('--symbols='));
+const explicitSymbols = symbolsArg
+  ? symbolsArg.split('=')[1].split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+  : null;
+
 const topVolumeArg = process.argv.find(a => a.startsWith('--top-volume='));
 const topVolumeCount = topVolumeArg ? Number(topVolumeArg.split('=')[1]) : null;
-const symbols = topVolumeCount
-  ? await fetchTopVolumeSymbols(topVolumeCount)
-  : SYMBOLS;
+const symbols = explicitSymbols
+  ? explicitSymbols
+  : topVolumeCount
+    ? await fetchTopVolumeSymbols(topVolumeCount)
+    : SYMBOLS;
 
-console.log(`\nFutures Backtest — ${symbols.join(', ')} — ${INTERVAL} — ${PAGES * 1000} bars each`);
+console.log(`\nFutures Backtest — ${symbols.join(', ')} — ${INTERVAL} — ${PAGES * 1000} bars each (~${Math.round(PAGES * 1000 / 96)} days)`);
 console.log(`Kill zones: London Open 07-10 UTC, NY Open 13-16 UTC\n`);
 
 const allTrades = [];
